@@ -55,6 +55,8 @@ Panel {
   readonly property string daemonPath: Qt.resolvedUrl("bin/omaherdr-daemon").toString().replace(/^file:\/\//, "")
   // How often the daemon looks for herdr clients coming and going (agent status is pushed, not polled).
   readonly property int scanIntervalSec: Math.max(2, Math.min(60, Number(setting("scanIntervalSec", 10))))
+  // When several terminal windows host the same server, jump to this one (window-class substring; "auto" = rank by title).
+  readonly property string preferTerminal: String(setting("preferTerminal", "auto"))
 
   function setting(name, fallback) {
     var s = root.settings || ({})
@@ -135,7 +137,7 @@ Panel {
   // ---------------------------------------------------------------- daemon
   Process {
     id: daemon
-    command: [root.daemonPath, "--scan", String(root.scanIntervalSec)]
+    command: [root.daemonPath, "--scan", String(root.scanIntervalSec), "--prefer", root.preferTerminal]
     running: true
     stdinEnabled: true
     stdout: SplitParser {

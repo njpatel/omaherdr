@@ -28,7 +28,8 @@
       "barIcon": "robot",
       "view": "agents",
       "barStyle": "lights",
-      "scanIntervalSec": 10
+      "scanIntervalSec": 10,
+      "preferTerminal": "auto"
     },
     "schema": [
       {
@@ -82,6 +83,13 @@
         "step": 1,
         "defaultValue": 10,
         "description": "How often the daemon looks for herdr clients starting or stopping. Agent status itself is pushed by herdr, so this only affects how quickly a new or closed session shows up."
+      },
+      {
+        "key": "preferTerminal",
+        "type": "string",
+        "label": "Preferred terminal for jumps",
+        "defaultValue": "auto",
+        "description": "When more than one terminal window hosts the same herdr server, jump to the one whose window class contains this (kitty, foot, alacritty, ghostty, wezterm). auto = pick by herdr's window title, then the current workspace, then most recent focus."
       }
     ]
   }

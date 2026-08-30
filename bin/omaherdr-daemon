@@ -6,6 +6,7 @@
 #
 #   stdout  {"generated_ts":…, "counts":{…}, "servers":[…]}       one line per change
 #   args    --scan N                                              seconds between process scans (default 10)
+#           --prefer CLASS                                        terminal to jump to when several host the same server
 #   stdin   refresh                                               re-snapshot every server
 #           go <server-key> <ws|tab|pane> <id>                    focus the terminal window, then the target
 #           quit
@@ -33,6 +34,7 @@ STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/
 SINCE_FILE = os.path.join(STATE_DIR, "since.json")
 DEFAULT_SOCK = "~/.config/herdr/herdr.sock"
 SCAN_EVERY = 10.0         # process scan; overridable with --scan N
+PREFER_TERMINAL = ""      # window-class substring that wins the ranking; --prefer CLASS
 SNAPSHOT_EVERY = 60.0
 DEBOUNCE = 0.25
 
@@ -438,8 +440,15 @@ def emit(servers, discovered_ts):
 
 
 def main():
-    global SCAN_EVERY
+    global SCAN_EVERY, PREFER_TERMINAL
     args = sys.argv[1:]
+    if "--prefer" in args:
+        try:
+            PREFER_TERMINAL = args[args.index("--prefer") + 1].strip().lower()
+        except IndexError:
+            pass
+        if PREFER_TERMINAL == "auto":
+            PREFER_TERMINAL = ""
     if "--scan" in args:
         try:
             SCAN_EVERY = max(2.0, float(args[args.index("--scan") + 1]))
@@ -528,7 +537,8 @@ def main():
                             cur_ws = json.loads(run(["hyprctl", "activeworkspace", "-j"])).get("id")
                         except ValueError:
                             cur_ws = None
-                        wins = sorted(wins, key=lambda w: (bool(label) and label in w.get("title", ""), hostl in w.get("title", ""),
+                        wins = sorted(wins, key=lambda w: (bool(PREFER_TERMINAL) and PREFER_TERMINAL in (w.get("class") or "").lower(),
+                                                           bool(label) and label in w.get("title", ""), hostl in w.get("title", ""),
                                                            w.get("workspace") == cur_ws, -int(w.get("focus_rank", 999))), reverse=True)
                     if wins:
                         # Hyprland ≥ 0.56 dispatches Lua; older builds take the classic form.
