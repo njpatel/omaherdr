@@ -5,7 +5,7 @@
 # Started by Widget.qml (stdout → the panel, stdin ← the panel):
 #
 #   stdout  {"generated_ts":…, "counts":{…}, "servers":[…]}       one line per change
-#   args    --scan N                                              seconds between process scans (default 5)
+#   args    --scan N                                              seconds between process scans (default 10)
 #   stdin   refresh                                               re-snapshot every server
 #           go <server-key> <ws|tab|pane> <id>                    focus the terminal window, then the target
 #           quit
@@ -32,7 +32,7 @@ HELPER = os.path.join(HERE, "omaherdr-helper")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy", "omaherdr")
 SINCE_FILE = os.path.join(STATE_DIR, "since.json")
 DEFAULT_SOCK = "~/.config/herdr/herdr.sock"
-SCAN_EVERY = 5.0          # process scan; overridable with --scan N
+SCAN_EVERY = 10.0         # process scan; overridable with --scan N
 SNAPSHOT_EVERY = 60.0
 DEBOUNCE = 0.25
 

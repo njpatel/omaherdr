@@ -28,7 +28,7 @@
       "barIcon": "robot",
       "view": "agents",
       "barStyle": "lights",
-      "scanIntervalSec": 5
+      "scanIntervalSec": 10
     },
     "schema": [
       {
@@ -80,7 +80,7 @@
         "min": 2,
         "max": 60,
         "step": 1,
-        "defaultValue": 5,
+        "defaultValue": 10,
         "description": "How often the daemon looks for herdr clients starting or stopping. Agent status itself is pushed by herdr, so this only affects how quickly a new or closed session shows up."
       }
     ]

@@ -54,7 +54,7 @@ Panel {
 
   readonly property string daemonPath: Qt.resolvedUrl("bin/omaherdr-daemon").toString().replace(/^file:\/\//, "")
   // How often the daemon looks for herdr clients coming and going (agent status is pushed, not polled).
-  readonly property int scanIntervalSec: Math.max(2, Math.min(60, Number(setting("scanIntervalSec", 5))))
+  readonly property int scanIntervalSec: Math.max(2, Math.min(60, Number(setting("scanIntervalSec", 10))))
 
   function setting(name, fallback) {
     var s = root.settings || ({})
