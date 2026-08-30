@@ -5,6 +5,7 @@
 # Started by Widget.qml (stdout → the panel, stdin ← the panel):
 #
 #   stdout  {"generated_ts":…, "counts":{…}, "servers":[…]}       one line per change
+#   args    --scan N                                              seconds between process scans (default 5)
 #   stdin   refresh                                               re-snapshot every server
 #           go <server-key> <ws|tab|pane> <id>                    focus the terminal window, then the target
 #           quit
@@ -31,7 +32,7 @@ HELPER = os.path.join(HERE, "omaherdr-helper")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy", "omaherdr")
 SINCE_FILE = os.path.join(STATE_DIR, "since.json")
 DEFAULT_SOCK = "~/.config/herdr/herdr.sock"
-SCAN_EVERY = 5.0
+SCAN_EVERY = 5.0          # process scan; overridable with --scan N
 SNAPSHOT_EVERY = 60.0
 DEBOUNCE = 0.25
 
@@ -393,6 +394,13 @@ def emit(servers, discovered_ts):
 
 
 def main():
+    global SCAN_EVERY
+    args = sys.argv[1:]
+    if "--scan" in args:
+        try:
+            SCAN_EVERY = max(2.0, float(args[args.index("--scan") + 1]))
+        except (IndexError, ValueError):
+            pass
     discovery = Discovery()
     servers, helpers = {}, {}
     remembered = load_since()
