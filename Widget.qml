@@ -38,6 +38,13 @@ Panel {
     Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "barIcon", barIconName])
   }
 
+  property string barStyle: String(setting("barStyle", "lights"))   // lights | inverse
+  readonly property bool inverse: barStyle === "inverse"
+  function toggleBarStyle() {
+    barStyle = inverse ? "lights" : "inverse"
+    Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "barStyle", barStyle])
+  }
+
   property string viewMode: String(setting("view", "agents"))   // agents | spaces
   function toggleView() {
     viewMode = viewMode === "agents" ? "spaces" : "agents"
@@ -194,6 +201,7 @@ Panel {
     function view(): string { root.toggleView(); return root.viewMode }
     function filter(text: string): string { root.filter = text; return root.filter }
     function metric(name: string): string { root.barMetric = name; return root.barMetric }
+    function style(name: string): string { root.barStyle = name; return root.barStyle }
     function metrics(): string {
       return JSON.stringify({ lines: root.rows.length, textImplicit: tuiText.implicitHeight, textHeight: tuiText.height,
                               flickContent: panelFlick.contentHeight, flickHeight: panelFlick.height, panelContent: panel.contentHeight })
@@ -247,6 +255,7 @@ Panel {
   onNowMsChanged: rebuild()
   onBarMetricChanged: rebuild()
   onBarIconNameChanged: rebuild()
+  onBarStyleChanged: rebuild()
   onFgChanged: rebuild()
   Component.onCompleted: rebuild()
 
@@ -339,7 +348,7 @@ Panel {
 
     out += rule("", false, false)
     out += line(cell("j/k move · ⏎ jump · / filter · h hide · R refresh", inner, dim))
-    out += line(cell("v view " + viewMode + " · r bar " + barMetric + " · i icon " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
+    out += line(cell("v " + viewMode + " · r " + barMetric + " · i " + barStyle + " · I " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
     if (filtering || filter) out += line(cat(cell("/ " + filter, inner - 2, accent), cell(filtering ? "▏" : "", 2, accent)))
     out += rule("", false, true)
     return finish(out)
@@ -513,16 +522,26 @@ Panel {
 
   implicitWidth: row.implicitWidth
   implicitHeight: bar ? bar.barSize : Style.bar.sizeHorizontal
+  readonly property real openPanelIndicatorWidth: row.width
+
+  // Text that reads on a coloured pill: theme background on light colours,
+  // theme foreground on dark ones.
+  function onColor(c) {
+    var lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+    return lum > 0.45 ? Color.background : Color.foreground
+  }
+  readonly property real pillHeight: Style.font.caption + Style.space(4)
 
   Row {
     id: row
     anchors.centerIn: parent
 
     // Icon-only mode: a vertical stack of the lit lights, left of the icon.
+    // The icon slot already pads its glyph, so the stack leans into that.
     Item {
       id: stack
-      visible: root.barMetric === "none" && root.stackLights.length > 0 && !(root.bar && root.bar.vertical)
-      width: visible ? root.dot + Style.space(4) : 0
+      visible: root.barMetric === "none" && !root.inverse && root.stackLights.length > 0 && !(root.bar && root.bar.vertical)
+      width: visible ? Math.max(0, root.dot + Style.space(3) - (button.slotSize - button.opticalSize) / 2) : 0
       height: row.height
       Column {
         anchors.verticalCenter: parent.verticalCenter
@@ -538,7 +557,33 @@ Panel {
       id: button
       bar: root.bar
       text: root.barIcon
+      foreground: backdrop.on ? root.onColor(root.stackLights[0].color) : (root.bar ? root.bar.barForeground : root.fg)
       onPressed: function(buttonCode) { root.barPressed(buttonCode) }
+
+      // Inverse icon-only mode: the lit colours as bands behind the icon.
+      Rectangle {
+        id: backdrop
+        readonly property bool on: root.inverse && root.barMetric === "none" && root.stackLights.length > 0
+        visible: on
+        z: -1
+        anchors.centerIn: parent
+        width: button.opticalSize + Style.space(8)
+        height: root.pillHeight
+        radius: Style.space(3)
+        color: "transparent"
+        clip: true
+        Column {
+          anchors.fill: parent
+          Repeater {
+            model: root.stackLights
+            Rectangle {
+              width: backdrop.width
+              height: backdrop.height / Math.max(1, root.stackLights.length)
+              color: modelData.color
+            }
+          }
+        }
+      }
     }
 
     // Number modes: one light and its count per state, spaced to scan.
@@ -551,16 +596,34 @@ Panel {
       Row {
         id: combos
         anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(8)
+        spacing: root.inverse ? Style.space(5) : Style.space(8)
         Repeater {
           model: root.comboLights
-          Row {
-            spacing: Style.space(4)
-            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: root.dot; height: root.dot; radius: 1; color: modelData.color }
-            Text {
+          // lights: a square light and its count · inverse: the count on a pill of that colour
+          Item {
+            width: root.inverse ? pill.width : (root.dot + Style.space(4) + count.implicitWidth)
+            height: root.pillHeight
+            Rectangle {
+              id: pill
+              visible: root.inverse
               anchors.verticalCenter: parent.verticalCenter
+              width: count.implicitWidth + Style.space(8)
+              height: root.pillHeight
+              radius: Style.space(3)
+              color: modelData.color
+            }
+            Rectangle {
+              visible: !root.inverse
+              anchors.verticalCenter: parent.verticalCenter
+              width: root.dot; height: root.dot; radius: 1
+              color: modelData.color
+            }
+            Text {
+              id: count
+              anchors.verticalCenter: parent.verticalCenter
+              x: root.inverse ? Style.space(4) : root.dot + Style.space(4)
               text: modelData.count
-              color: root.bar ? root.bar.barForeground : root.fg
+              color: root.inverse ? root.onColor(modelData.color) : (root.bar ? root.bar.barForeground : root.fg)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
@@ -620,7 +683,8 @@ Panel {
         else if (t === "r") root.cycleBarMetric()
         else if (t === "R") root.refresh()
         else if (t === "v" || t === "V") root.toggleView()
-        else if (t === "i" || t === "I") root.cycleBarIcon()
+        else if (t === "i") root.toggleBarStyle()
+        else if (t === "I") root.cycleBarIcon()
         else if (t === "g") { root.cursor = 0; panelFlick.contentY = 0 }
         else if (t === "G") { root.moveCursor(root.jumps.length) }
       }

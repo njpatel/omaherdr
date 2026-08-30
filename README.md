@@ -34,7 +34,8 @@ The bar shows the icon with traffic lights: red for agents waiting for input, ye
 | `v` | agents (most urgent first) / spaces (every space with its tabs) |
 | `h` | redact names |
 | `r` | cycle what the bar shows: attention, all, none |
-| `i` | cycle the bar icon |
+| `i` | lights / inverse: a square beside each count, or the count on a pill of that colour (icon-only mode paints the colours behind the icon) |
+| `I` | cycle the bar icon |
 | `R` | refresh |
 
 Status is live: the daemon subscribes to herdr's events, so the bar flips the moment an agent blocks on a question or finishes. `since` is how long the agent has been in its current state, as observed from here. Settings live on the bar entry: `omarchy bar set njpatel.omaherdr barMetric all` (or `barIcon`, `view`).
