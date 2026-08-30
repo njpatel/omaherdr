@@ -114,6 +114,37 @@ def parse_attachment(argv):
     return {"remote": remote, "session": session}
 
 
+def terminal_hint(pid):
+    """Tab/pane handle for the terminal hosting this process, from its environment.
+    kitty sets KITTY_LISTEN_ON + KITTY_WINDOW_ID (remote control must be on, as
+    Omarchy configures); WezTerm sets WEZTERM_UNIX_SOCKET + WEZTERM_PANE."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            env = dict(kv.split(b"=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
+    except OSError:
+        return None
+    g = lambda k: env.get(k.encode(), b"").decode(errors="replace")
+    if g("KITTY_LISTEN_ON") and g("KITTY_WINDOW_ID"):
+        return {"kind": "kitty", "listen": g("KITTY_LISTEN_ON"), "window": g("KITTY_WINDOW_ID")}
+    if g("WEZTERM_PANE"):
+        return {"kind": "wezterm", "socket": g("WEZTERM_UNIX_SOCKET"), "pane": g("WEZTERM_PANE")}
+    return None
+
+
+def focus_terminal_tab(hint):
+    """After the compositor focused the terminal window, bring the right tab/pane up."""
+    if not hint:
+        return
+    if hint["kind"] == "kitty":
+        subprocess.run(["kitten", "@", "--to", hint["listen"], "focus-window", "--match", "id:" + hint["window"]],
+                       capture_output=True, timeout=5)
+    elif hint["kind"] == "wezterm":
+        env = dict(os.environ)
+        if hint.get("socket"):
+            env["WEZTERM_UNIX_SOCKET"] = hint["socket"]
+        subprocess.run(["wezterm", "cli", "activate-pane", "--pane-id", hint["pane"]], capture_output=True, timeout=5, env=env)
+
+
 def parse_session_list(text):
     """`herdr session list` → {name: {"status":…, "socket":…}}"""
     rows = {}
@@ -183,6 +214,7 @@ class Discovery:
             entry = found.setdefault(key, {"host": host, "session": session, "socket": sock, "herdr_bin": herdr_bin, "windows": []})
             win = window_for(pid)
             if win and win["address"] not in [w["address"] for w in entry["windows"]]:
+                win["terminal"] = terminal_hint(pid)
                 entry["windows"].append(win)
 
         # Local servers running with no client attached.
@@ -477,6 +509,10 @@ def main():
                         r = subprocess.run(["hyprctl", "dispatch", 'hl.dsp.focus({ window = "%s" })' % addr], capture_output=True, text=True)
                         if "error" in (r.stdout + r.stderr).lower():
                             subprocess.run(["hyprctl", "dispatch", "focuswindow", addr], capture_output=True)
+                        try:
+                            focus_terminal_tab(wins[0].get("terminal"))
+                        except (OSError, subprocess.TimeoutExpired) as e:
+                            log("terminal tab focus failed:", e)
                     method, params = {
                         "ws": ("workspace.focus", {"workspace_id": target}),
                         "tab": ("tab.focus", {"tab_id": target}),
