@@ -463,8 +463,11 @@ def main():
                 if s:
                     wins = s.info.get("windows") or []
                     if wins:
-                        subprocess.run(["hyprctl", "dispatch", "focuswindow", "address:" + str(wins[0]["address"])],
-                                       capture_output=True)
+                        # Hyprland ≥ 0.56 dispatches Lua; older builds take the classic form.
+                        addr = "address:" + str(wins[0]["address"])
+                        r = subprocess.run(["hyprctl", "dispatch", 'hl.dsp.focus({ window = "%s" })' % addr], capture_output=True, text=True)
+                        if "error" in (r.stdout + r.stderr).lower():
+                            subprocess.run(["hyprctl", "dispatch", "focuswindow", addr], capture_output=True)
                     method, params = {
                         "ws": ("workspace.focus", {"workspace_id": target}),
                         "tab": ("tab.focus", {"tab_id": target}),
