@@ -44,6 +44,20 @@ The bar shows the icon with traffic lights: red for agents waiting for input, ye
 
 Status is live: the daemon subscribes to herdr's events, so the bar flips the moment an agent blocks on a question or finishes. `since` is how long the agent has been in its current state, as observed from here. Settings live on the bar entry: `omarchy bar set njpatel.omaherdr barMetric all` (or `barStyle`, `barIcon`, `view`, and `scanIntervalSec` for how often new or closed sessions are looked for, default 10).
 
+## Terminals
+
+A jump first focuses the window that hosts your herdr client, then the tab or pane inside it where the terminal allows.
+
+| terminal | jump lands on | tested |
+|---|---|---|
+| kitty | window, then the exact tab/pane (via kitty remote control, on by default in Omarchy) | yes |
+| foot | window (foot has no tabs) | yes |
+| Alacritty | window (no tabs) | not yet, same path as foot |
+| Ghostty | window, chosen by herdr's window title when several share one process; tabs cannot be driven from outside | not yet |
+| WezTerm | window, then the pane via `wezterm cli` | not yet |
+
+Anything else gets the window. Windows are matched from the client's process tree, so it works for `herdr`, `herdr --session`, and `herdr --remote` alike, in any terminal Hyprland can see.
+
 ## How it works
 
 `bin/omaherdr-daemon` scans processes every 10 s, maps each herdr client to its Hyprland window, and runs one `bin/omaherdr-helper` per server (shipped inline over ssh for remote hosts). The helper takes a `session.snapshot`, subscribes to workspace, tab, pane and per-pane agent-status events, and streams them back; the daemon folds everything into one JSON state per change, which `Widget.qml` renders. Jumps go the other way: `focuswindow` in Hyprland, then the terminal tab that hosts the client (kitty via its remote control, WezTerm via `wezterm cli`; foot and Alacritty have no tabs, so the window is enough; Ghostty and `foot --server` run every window from one process, so the window is picked by its herdr title), then `workspace.focus` / `tab.focus` / `pane.focus` on the right server.
