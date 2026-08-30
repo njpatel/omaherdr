@@ -65,6 +65,22 @@ Panel {
   property var snap: null
   property bool scrub: false
   property int cursor: 0
+  property string filter: ""       // substring, case-insensitive
+  property bool filtering: false   // typing into the filter (/)
+  function matches(text) {
+    if (!filter) return true
+    return String(text || "").toLowerCase().indexOf(filter.toLowerCase()) >= 0
+  }
+  function startFilter() {
+    filtering = true
+    Qt.callLater(function() { filterCatcher.forceActiveFocus() })
+  }
+  function stopFilter(clear) {
+    if (clear) filter = ""
+    filtering = false
+    cursor = 0
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
   property double nowMs: Date.now()
   readonly property var counts: snap && snap.counts ? snap.counts : ({})
   readonly property var servers: snap && snap.servers ? snap.servers : []
@@ -140,6 +156,8 @@ Panel {
     panelFlick.contentY = 0
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  } else {
+    filtering = false
   }
 
   IpcHandler {
@@ -150,6 +168,11 @@ Panel {
     function refresh(): string { root.refresh(); return "ok" }
     function scrub(): string { root.scrub = !root.scrub; return root.scrub ? "scrubbed" : "clear" }
     function view(): string { root.toggleView(); return root.viewMode }
+    function filter(text: string): string { root.filter = text; return root.filter }
+    function metrics(): string {
+      return JSON.stringify({ lines: root.rows.length, textImplicit: tuiText.implicitHeight, textHeight: tuiText.height,
+                              flickContent: panelFlick.contentHeight, flickHeight: panelFlick.height, panelContent: panel.contentHeight })
+    }
     function geometry(): string {
       return JSON.stringify({ x: panel.cardOrigin.x, y: panel.cardOrigin.y, w: panel.contentWidth, h: panel.contentHeight })
     }
@@ -193,6 +216,8 @@ Panel {
   onSnapChanged: rebuild()
   onCursorChanged: rebuild()
   onScrubChanged: rebuild()
+  onFilterChanged: { cursor = 0; rebuild() }
+  onFilteringChanged: rebuild()
   onViewModeChanged: rebuild()
   onNowMsChanged: rebuild()
   onBarMetricChanged: rebuild()
@@ -287,9 +312,10 @@ Panel {
       jumpIdx = part.jumpIdx
     }
 
-    var foot = "bar " + barMetric + " · icon " + barIconName + " · view " + viewMode + (scrub ? " · hidden" : "")
     out += rule("", false, false)
-    out += line(cell(foot, inner, fg))
+    out += line(cell("j/k move · ⏎ jump · / filter · h hide · R refresh", inner, dim))
+    out += line(cell("v view " + viewMode + " · r bar " + barMetric + " · i icon " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
+    if (filtering || filter) out += line(cat(cell("/ " + filter, inner - 2, accent), cell(filtering ? "▏" : "", 2, accent)))
     out += rule("", false, true)
     return finish(out)
   }
@@ -297,7 +323,8 @@ Panel {
   function finish(out) {
     rows = scratch.rows; jumps = scratch.jumps
     checkWidths(out)
-    return out
+    // A trailing <br> renders as an empty line and pads the card.
+    return out.replace(/<br>$/, "")
   }
 
   function spaceName(snap, wsId) {
@@ -322,19 +349,24 @@ Panel {
     })
     out += line(cat(gap(2), cell("agent", 9, faint), gap(1), cell("space › tab", 25, faint), gap(1), cell("status", 11, faint), gap(1), cell("since", 6, faint, true)))
     if (agents.length === 0) out += line(cat(gap(2), cell("no agents running", inner - 2, dim)))
+    var shown = 0
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i], st = a.agent_status || "unknown"
       var ws = spaceName(snap, a.workspace_id), tab = tabName(snap, a.tab_id)
-      var loc = label(ws ? ws.label : a.workspace_id) + " › " + label(tab ? tab.label : a.tab_id)
+      var wsLabel = ws ? ws.label : a.workspace_id, tabLabel = tab ? tab.label : a.tab_id
+      if (!matches((a.name || "") + " " + a.agent + " " + wsLabel + " " + tabLabel + " " + statusText(st))) continue
+      shown++
+      var loc = label(wsLabel) + " › " + label(tabLabel)
       var target = { server: srv.key, kind: "pane", id: a.pane_id }
       var hl = isCursor(jumpIdx++)
-      var col = statusColor(st)
+      var col = statusColor(st), active = st !== "idle"
       out += line(cat(cell(statusGlyph(st), 1, col, false, hl ? hilite : null), gap(1, hl ? hilite : null),
-                      cell(a.name ? label(a.name) : a.agent, 9, st === "idle" ? dim : fg, false, hl ? hilite : null), gap(1, hl ? hilite : null),
-                      cell(loc, 25, dim, false, hl ? hilite : null), gap(1, hl ? hilite : null),
+                      cell(a.name ? label(a.name) : a.agent, 9, active ? fg : dim, false, hl ? hilite : null), gap(1, hl ? hilite : null),
+                      cell(loc, 25, active ? fg : dim, false, hl ? hilite : null), gap(1, hl ? hilite : null),
                       cell(statusText(st), 11, col, false, hl ? hilite : null), gap(1, hl ? hilite : null),
                       cell(fmtSince(since[a.pane_id]), 6, dim, true, hl ? hilite : null)), target, hl)
     }
+    if (agents.length > 0 && shown === 0) out += line(cat(gap(2), cell("nothing matches “" + filter + "”", inner - 2, dim)))
     return { html: out, jumpIdx: jumpIdx }
   }
 
@@ -352,17 +384,30 @@ Panel {
       if (!agentsByTab[snap.agents[a].tab_id]) agentsByTab[snap.agents[a].tab_id] = []
       agentsByTab[snap.agents[a].tab_id].push(snap.agents[a])
     }
+    var shownSpaces = 0
     for (var w = 0; w < snap.workspaces.length; w++) {
       var ws = snap.workspaces[w], st = ws.agent_status || ""
       var tabs = byWs[ws.workspace_id] || []
       var nAgents = 0
       for (var k = 0; k < tabs.length; k++) nAgents += (agentsByTab[tabs[k].tab_id] || []).length
+      // Filter: a space that matches shows every tab; otherwise only matching tabs.
+      var wsMatch = matches(ws.label)
+      if (filter && !wsMatch) {
+        tabs = tabs.filter(function(t) {
+          var ag0 = agentsByTab[t.tab_id] || [], text = t.label + " " + statusText(t.agent_status || "")
+          for (var q = 0; q < ag0.length; q++) text += " " + (ag0[q].name || "") + " " + ag0[q].agent + " " + statusText(ag0[q].agent_status || "")
+          return matches(text)
+        })
+        if (tabs.length === 0) continue
+      }
+      shownSpaces++
       var info = tabs.length + (tabs.length === 1 ? " tab" : " tabs") + (nAgents > 0 ? " · " + nAgents + (nAgents === 1 ? " agent" : " agents") : "")
       var hl = isCursor(jumpIdx++)
       var bg = hl ? hilite : null
       var focused = snap.focused_workspace_id === ws.workspace_id
+      var wsActive = nAgents > 0 && st !== "idle" && st !== ""
       out += line(cat(cell(ws.number, 2, focused ? accent : dim, true, bg), gap(1, bg),
-                      cell(label(ws.label), 22, focused ? accent : fg, false, bg), gap(1, bg),
+                      cell(label(ws.label), 22, focused ? accent : (wsActive || nAgents > 0 ? fg : dim), false, bg), gap(1, bg),
                       cell(nAgents > 0 ? statusGlyph(st) + " " + statusText(st) : "", 13, statusColor(st), false, bg), gap(1, bg),
                       cell(info, 17, dim, false, bg)), { server: srv.key, kind: "ws", id: ws.workspace_id }, hl)
       for (var i = 0; i < tabs.length; i++) {
@@ -373,13 +418,15 @@ Panel {
         var thl = isCursor(jumpIdx++)
         var tbg = thl ? hilite : null
         var tfocused = snap.focused_tab_id === tab.tab_id
+        var tActive = ag.length > 0 && tst !== "idle"
         out += line(cat(gap(2, tbg), cell(i === tabs.length - 1 ? "└" : "├", 1, faint, false, tbg), gap(1, tbg),
-                        cell(label(tab.label), 22, tfocused ? accent : (ag.length > 0 ? fg : dim), false, tbg), gap(1, tbg),
+                        cell(label(tab.label), 22, tfocused ? accent : (tActive ? fg : dim), false, tbg), gap(1, tbg),
                         cell(ag.length > 0 ? statusGlyph(tst) + " " + statusText(tst) : "", 13, statusColor(tst), false, tbg), gap(1, tbg),
-                        cell(names.join(" "), 9, dim, false, tbg), gap(1, tbg),
+                        cell(names.join(" "), 9, tActive ? fg : dim, false, tbg), gap(1, tbg),
                         cell(newest ? fmtSince(newest) : "", 5, dim, true, tbg)), { server: srv.key, kind: "tab", id: tab.tab_id }, thl)
       }
     }
+    if (snap.workspaces.length > 0 && shownSpaces === 0) out += line(cat(gap(2), cell("nothing matches “" + filter + "”", inner - 2, dim)))
     return { html: out, jumpIdx: jumpIdx }
   }
 
@@ -494,7 +541,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(colMetrics.advanceWidth + panel.padding * 2 + Style.space(12))
-    contentHeight: panel.fittedContentHeight(tuiText.implicitHeight + Style.space(12), Style.space(920))
+    contentHeight: panel.fittedContentHeight(tuiText.implicitHeight + Style.space(8), Style.space(920))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -508,12 +555,28 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "r") root.cycleBarMetric()
+        if (t === "/") root.startFilter()
+        else if (t === "r") root.cycleBarMetric()
         else if (t === "R") root.refresh()
         else if (t === "v" || t === "V") root.toggleView()
         else if (t === "i" || t === "I") root.cycleBarIcon()
         else if (t === "g") { root.cursor = 0; panelFlick.contentY = 0 }
         else if (t === "G") { root.moveCursor(root.jumps.length) }
+      }
+
+      // While filtering every printable key is text; Esc clears/leaves, Enter keeps the filter.
+      Item {
+        id: filterCatcher
+        anchors.fill: parent
+        focus: root.filtering
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Escape) { root.stopFilter(true); event.accepted = true; return }
+          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.stopFilter(false); event.accepted = true; return }
+          if (event.key === Qt.Key_Backspace) { root.filter = root.filter.slice(0, -1); event.accepted = true; return }
+          if (event.key === Qt.Key_Down) { root.moveCursor(1); event.accepted = true; return }
+          if (event.key === Qt.Key_Up) { root.moveCursor(-1); event.accepted = true; return }
+          if (event.text && event.text.length === 1 && event.text >= " ") { root.filter += event.text; event.accepted = true }
+        }
       }
 
       Flickable {

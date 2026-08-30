@@ -29,6 +29,7 @@ The bar shows the icon, plus `!N` agents waiting for input and `✓N` agents tha
 | key | |
 |---|---|
 | `j` `k` | move |
+| `/` | filter by space, tab, agent or status; `Esc` clears |
 | `Enter` / click | jump: focuses the terminal window, then the space, tab or agent inside herdr |
 | `v` | agents (most urgent first) / spaces (every space with its tabs) |
 | `h` | redact names |
