@@ -393,7 +393,7 @@ Panel {
       var a = agents[i], st = a.agent_status || "unknown"
       var ws = spaceName(snap, a.workspace_id), tab = tabName(snap, a.tab_id)
       var wsLabel = ws ? ws.label : a.workspace_id, tabLabel = tab ? tab.label : a.tab_id
-      if (!matches((a.name || "") + " " + a.agent + " " + wsLabel + " " + tabLabel + " " + statusText(st))) continue
+      if (!matches((a.name || "") + " " + a.agent + " " + wsLabel + " " + tabLabel + " " + st + " " + statusText(st))) continue
       shown++
       var loc = label(wsLabel) + " › " + label(tabLabel)
       var target = { server: srv.key, kind: "pane", id: a.pane_id }
@@ -433,8 +433,8 @@ Panel {
       var wsMatch = matches(ws.label)
       if (filter && !wsMatch) {
         tabs = tabs.filter(function(t) {
-          var ag0 = agentsByTab[t.tab_id] || [], text = t.label + " " + statusText(t.agent_status || "")
-          for (var q = 0; q < ag0.length; q++) text += " " + (ag0[q].name || "") + " " + ag0[q].agent + " " + statusText(ag0[q].agent_status || "")
+          var ag0 = agentsByTab[t.tab_id] || [], text = t.label + " " + (t.agent_status || "") + " " + statusText(t.agent_status || "")
+          for (var q = 0; q < ag0.length; q++) text += " " + (ag0[q].name || "") + " " + ag0[q].agent + " " + (ag0[q].agent_status || "") + " " + statusText(ag0[q].agent_status || "")
           return matches(text)
         })
         if (tabs.length === 0) continue
