@@ -24,6 +24,8 @@ omarchy restart shell
 
 Nothing to configure. Omaherdr finds every `herdr` you are attached to from this desktop - plain, `--session NAME`, or `--remote HOST` - by looking at the processes in your terminal windows, then talks to each server over its socket (through `ssh HOST` for remote ones, which needs a key that works non-interactively and `python3` on the far side). A local server running with nobody attached is listed too.
 
+Remove with `omarchy plugin remove njpatel.omaherdr`; it leaves nothing behind except `~/.local/state/omarchy/omaherdr/` (delete it if you like). Needs herdr 0.8 or newer and `python3`; for `--remote` hosts, an SSH key that works non-interactively and `python3` there too. No other dependencies.
+
 ## Use
 
 The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green; `active` adds yellow; `all` adds grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
