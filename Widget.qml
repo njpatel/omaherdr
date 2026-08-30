@@ -531,8 +531,7 @@ Panel {
     return lum > 0.45 ? Color.background : Color.foreground
   }
   readonly property real pillHeight: Style.font.caption + Style.space(4)
-  readonly property color hairline: bar ? bar.barForeground : fg
-  readonly property bool splitButton: inverse && barMetric !== "none" && comboLights.length > 0
+
 
   Row {
     id: row
@@ -573,8 +572,6 @@ Panel {
         height: root.pillHeight
         radius: 2
         color: "transparent"
-        border.width: 1
-        border.color: root.hairline
         clip: true
         Column {
           anchors.fill: parent
@@ -600,14 +597,12 @@ Panel {
       Row {
         id: combos
         anchors.verticalCenter: parent.verticalCenter
-        spacing: root.inverse ? 0 : Style.space(8)
+        spacing: root.inverse ? Style.space(5) : Style.space(8)
         Repeater {
           model: root.comboLights
-          // lights: a square light and its count · inverse: a section of the split
-          // button filled with the state colour, hairline on its left edge
+          // lights: a square light and its count · inverse: the count on a pill of that colour
           Item {
             required property var modelData
-            required property int index
             width: root.inverse ? pill.width : (root.dot + Style.space(4) + count.implicitWidth)
             height: root.pillHeight
             Rectangle {
@@ -616,10 +611,8 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               width: count.implicitWidth + Style.space(8)
               height: root.pillHeight
-              topRightRadius: index === root.comboLights.length - 1 ? 2 : 0
-              bottomRightRadius: index === root.comboLights.length - 1 ? 2 : 0
+              radius: 2
               color: modelData.color
-              Rectangle { width: 1; height: parent.height; color: root.hairline }
             }
             Rectangle {
               visible: !root.inverse
@@ -630,7 +623,7 @@ Panel {
             Text {
               id: count
               anchors.verticalCenter: parent.verticalCenter
-              x: root.inverse ? Style.space(4) + 1 : root.dot + Style.space(4)
+              x: root.inverse ? Style.space(4) : root.dot + Style.space(4)
               text: modelData.count
               color: root.inverse ? root.onColor(modelData.color) : (root.bar ? root.bar.barForeground : root.fg)
               font.family: root.fontFamily
@@ -650,20 +643,6 @@ Panel {
         onExited: if (root.bar) root.bar.hideTooltip(metric)
       }
     }
-  }
-
-  // Split button frame for inverse number modes: icon section, then the counts.
-  Rectangle {
-    visible: root.splitButton && !(root.bar && root.bar.vertical)
-    x: row.x + button.x
-    anchors.verticalCenter: parent.verticalCenter
-    width: (metric.x + combos.width) - button.x
-    height: root.pillHeight
-    radius: 2
-    color: "transparent"
-    border.width: 1
-    border.color: root.hairline
-    z: 5
   }
 
   function barPressed(buttonCode) {
