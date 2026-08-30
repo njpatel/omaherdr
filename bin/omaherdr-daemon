@@ -53,11 +53,17 @@ def run(cmd, timeout=10):
 
 # ------------------------------------------------------------------ discovery
 def hypr_clients():
+    """pid → [clients]. Single-process terminals (Ghostty, foot --server) own
+    every window from one pid, so a pid can map to several windows."""
     out = run(["hyprctl", "clients", "-j"])
+    by_pid = {}
     try:
-        return {c["pid"]: c for c in json.loads(out) if c.get("pid")}
+        for c in json.loads(out):
+            if c.get("pid"):
+                by_pid.setdefault(c["pid"], []).append(c)
     except ValueError:
-        return {}
+        pass
+    return by_pid
 
 
 def proc_table():
@@ -179,16 +185,16 @@ class Discovery:
         procs = proc_table()
         found = {}
 
-        def window_for(pid):
+        def windows_for(pid):
             seen = 0
             while pid > 1 and seen < 64:
                 if pid in clients:
-                    c = clients[pid]
-                    return {"address": c.get("address"), "workspace": (c.get("workspace") or {}).get("id"),
-                            "class": c.get("class"), "pid": pid}
+                    return [{"address": c.get("address"), "workspace": (c.get("workspace") or {}).get("id"),
+                             "class": c.get("class"), "pid": pid, "title": c.get("title") or "",
+                             "focus_rank": c.get("focusHistoryID", 999)} for c in clients[pid]]
                 pid = procs.get(pid, (0, None))[0]
                 seen += 1
-            return None
+            return []
 
         for pid, (ppid, argv) in procs.items():
             att = parse_attachment(argv)
@@ -212,9 +218,12 @@ class Discovery:
                     sock = row["socket"]
             key = host + ":" + session
             entry = found.setdefault(key, {"host": host, "session": session, "socket": sock, "herdr_bin": herdr_bin, "windows": []})
-            win = window_for(pid)
-            if win and win["address"] not in [w["address"] for w in entry["windows"]]:
-                win["terminal"] = terminal_hint(pid)
+            hint = terminal_hint(pid)
+            for win in windows_for(pid):
+                if win["address"] in [w["address"] for w in entry["windows"]]:
+                    continue
+                win["terminal"] = hint
+                win["shared_pid"] = len(clients.get(win["pid"], [])) > 1
                 entry["windows"].append(win)
 
         # Local servers running with no client attached.
@@ -503,6 +512,21 @@ def main():
                 s = servers.get(skey)
                 if s:
                     wins = s.info.get("windows") or []
+                    if len(wins) > 1:
+                        # Several candidate windows (two clients on one server, or a
+                        # single-process terminal like Ghostty / foot --server owning
+                        # every window). herdr titles its terminal "{hostname}: {workspace}",
+                        # so prefer a title naming the server's focused space, then the
+                        # host, then a window on the current workspace, then most recent focus.
+                        snap = s.snapshot or {}
+                        label = next((w.get("label", "") for w in snap.get("workspaces", []) if w.get("workspace_id") == snap.get("focused_workspace_id")), "")
+                        hostl = s.info["host"] if s.info["host"] != "local" else os.uname().nodename
+                        try:
+                            cur_ws = json.loads(run(["hyprctl", "activeworkspace", "-j"])).get("id")
+                        except ValueError:
+                            cur_ws = None
+                        wins = sorted(wins, key=lambda w: (bool(label) and label in w.get("title", ""), hostl in w.get("title", ""),
+                                                           w.get("workspace") == cur_ws, -int(w.get("focus_rank", 999))), reverse=True)
                     if wins:
                         # Hyprland ≥ 0.56 dispatches Lua; older builds take the classic form.
                         addr = "address:" + str(wins[0]["address"])
