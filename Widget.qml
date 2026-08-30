@@ -63,10 +63,11 @@ Panel {
 
   // Traffic lights: red / yellow / green from the theme's colors.toml (the
   // shell only exposes foreground/accent/urgent), muted grey for idle.
+  // Bright variants first: the normal ones are often too muted to read at 6 px.
   property var palette: ({})
-  readonly property color red: palette.red || urgent
-  readonly property color yellow: palette.yellow || accent
-  readonly property color green: palette.green || accent
+  readonly property color red: palette.bright_red || palette.red || urgent
+  readonly property color yellow: palette.bright_yellow || palette.yellow || accent
+  readonly property color green: palette.bright_green || palette.green || accent
   readonly property color grey: Color.muted || dim
   FileView {
     path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
@@ -502,7 +503,7 @@ Panel {
   readonly property var stackLights: snap ? lightsFor(["blocked", "working", "done"]) : []
   readonly property var comboLights: !snap || barMetric === "none" ? [] :
     lightsFor(barMetric === "all" ? ["blocked", "working", "done", "idle"] : ["blocked", "done"])
-  readonly property int dot: Math.round(Style.font.caption * 0.5)
+  readonly property int dot: Math.round(Style.font.caption * 0.55)
   readonly property string barTooltip: {
     var c = counts
     if (!snap) return "Omaherdr"
