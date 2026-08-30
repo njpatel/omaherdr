@@ -531,7 +531,7 @@ Panel {
     return lum > 0.45 ? Color.background : Color.foreground
   }
   readonly property real pillHeight: Style.font.caption + Style.space(4)
-  readonly property color hairline: Qt.rgba(fg.r, fg.g, fg.b, 0.35)
+  readonly property color hairline: bar ? bar.barForeground : fg
   readonly property bool splitButton: inverse && barMetric !== "none" && comboLights.length > 0
 
   Row {
