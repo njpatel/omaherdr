@@ -401,6 +401,7 @@ def main():
     last_scan = 0.0
     dirty_at = None
     scan_ts = 0.0
+    emit(servers, scan_ts)  # an empty state straight away, so the widget never sits blank
 
     while True:
         now = time.time()

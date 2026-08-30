@@ -34,7 +34,7 @@ The bar shows the icon with traffic lights: red for agents waiting for input, ye
 | `v` | agents (most urgent first) / spaces (every space with its tabs) |
 | `h` | redact names |
 | `r` | cycle what the bar shows: attention, active, all, none |
-| `l` | lights / inverse: a square beside each count, or the count on a pill of that colour (icon-only mode paints the colours behind the icon) |
+| `l` | lights / inverse: a square beside each count, or a split button — the icon, then one section per state filled with its colour (icon-only mode paints the colours behind the icon) |
 | `i` | cycle the bar icon |
 | `R` | refresh |
 
