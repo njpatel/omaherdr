@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# omaherdr-helper — one herdr server, spoken to over its unix socket.
+# omaherdr-helper - one herdr server, spoken to over its unix socket.
 #
 #   omaherdr-helper <socket-path>
 #

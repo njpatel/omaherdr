@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# omaherdr-daemon — finds every herdr the user is attached to from this desktop,
+# omaherdr-daemon - finds every herdr the user is attached to from this desktop,
 # follows each server live, and streams one merged JSON state per change.
 #
 # Started by Widget.qml (stdout → the panel, stdin ← the panel):

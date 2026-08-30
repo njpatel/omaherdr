@@ -121,7 +121,7 @@ Panel {
   // Priority order and glyphs per agent status.
   readonly property var statusOrder: ({ "blocked": 0, "done": 1, "working": 2, "unknown": 3, "idle": 4 })
   function statusGlyph(st) {
-    return st === "blocked" ? "!" : st === "done" ? "✓" : st === "working" ? "⠴" : st === "idle" ? "·" : st === "unknown" ? "?" : "—"
+    return st === "blocked" ? "!" : st === "done" ? "✓" : st === "working" ? "⠴" : st === "idle" ? "·" : st === "unknown" ? "?" : "-"
   }
   function statusColor(st) {
     return st === "blocked" ? red : st === "done" ? green : st === "working" ? yellow : st === "idle" ? grey : dim

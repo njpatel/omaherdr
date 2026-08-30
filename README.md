@@ -9,7 +9,7 @@
  ▀█████▀    ▀█   ███   █▀    ███   █▀    ▀█   █▀    ▀███████   ███   █▀    ▀███████▀    ███   █▀
 </pre>
 
-[herdr](https://herdr.dev) sessions, spaces, tabs and agents in the [Omarchy](https://omarchy.org) bar — with one keypress to jump to any of them.
+[herdr](https://herdr.dev) sessions, spaces, tabs and agents in the [Omarchy](https://omarchy.org) bar - with one keypress to jump to any of them.
 
 ![Omaherdr](assets/omaherdr.png)
 
@@ -20,7 +20,7 @@ omarchy plugin add https://github.com/njpatel/omaherdr.git --enable
 omarchy restart shell
 ```
 
-Nothing to configure. Omaherdr finds every `herdr` you are attached to from this desktop — plain, `--session NAME`, or `--remote HOST` — by looking at the processes in your terminal windows, then talks to each server over its socket (through `ssh HOST` for remote ones, which needs a key that works non-interactively and `python3` on the far side). A local server running with nobody attached is listed too.
+Nothing to configure. Omaherdr finds every `herdr` you are attached to from this desktop - plain, `--session NAME`, or `--remote HOST` - by looking at the processes in your terminal windows, then talks to each server over its socket (through `ssh HOST` for remote ones, which needs a key that works non-interactively and `python3` on the far side). A local server running with nobody attached is listed too.
 
 ## Use
 
