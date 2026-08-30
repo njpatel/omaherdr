@@ -50,13 +50,13 @@ A jump first focuses the window that hosts your herdr client, then the tab or pa
 
 | terminal | jump lands on | tested |
 |---|---|---|
-| kitty | window, then the exact tab/pane (via kitty remote control, on by default in Omarchy) | yes |
-| foot | window (foot has no tabs) | yes |
-| Alacritty | window (no tabs) | not yet, same path as foot |
-| Ghostty | window, chosen by herdr's window title when several share one process; tabs cannot be driven from outside | not yet |
-| WezTerm | window, then the pane via `wezterm cli` | not yet |
+| kitty 0.48 | window, then the exact tab/pane (via kitty remote control, on by default in Omarchy) | yes |
+| foot 1.27 | window (foot has no tabs) | yes |
+| Alacritty 0.17 | window (no tabs) | yes |
+| Ghostty 1.3 | window; when several windows share one process the one titled by herdr is chosen. Tabs cannot be driven from outside, so a herdr tab that is not the active one stays behind | yes |
+| WezTerm 2024-02 | window, then the exact pane via `wezterm cli` | yes |
 
-Anything else gets the window. Windows are matched from the client's process tree, so it works for `herdr`, `herdr --session`, and `herdr --remote` alike, in any terminal Hyprland can see.
+Anything else gets the window. Windows are matched from the client's process tree, so it works for `herdr`, `herdr --session`, and `herdr --remote` alike, in any terminal Hyprland can see. All five were tested on Omarchy with Hyprland 0.56: launch, discovery, and a jump from another workspace.
 
 ## How it works
 

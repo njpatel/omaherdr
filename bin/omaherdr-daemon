@@ -120,19 +120,23 @@ def parse_attachment(argv):
     return {"remote": remote, "session": session}
 
 
-def terminal_hint(pid):
+def terminal_hint(pid, window_class=""):
     """Tab/pane handle for the terminal hosting this process, from its environment.
     kitty sets KITTY_LISTEN_ON + KITTY_WINDOW_ID (remote control must be on, as
-    Omarchy configures); WezTerm sets WEZTERM_UNIX_SOCKET + WEZTERM_PANE."""
+    Omarchy configures); WezTerm sets WEZTERM_UNIX_SOCKET + WEZTERM_PANE. The
+    variables are inherited by anything launched from that terminal, so a hint
+    only counts when it matches the class of the window that actually hosts the
+    process (a Ghostty started from a kitty shell still carries KITTY_*)."""
     try:
         with open("/proc/%d/environ" % pid, "rb") as f:
             env = dict(kv.split(b"=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
     except OSError:
         return None
     g = lambda k: env.get(k.encode(), b"").decode(errors="replace")
-    if g("KITTY_LISTEN_ON") and g("KITTY_WINDOW_ID"):
+    cls = (window_class or "").lower()
+    if "kitty" in cls and g("KITTY_LISTEN_ON") and g("KITTY_WINDOW_ID"):
         return {"kind": "kitty", "listen": g("KITTY_LISTEN_ON"), "window": g("KITTY_WINDOW_ID")}
-    if g("WEZTERM_PANE"):
+    if "wezterm" in cls and g("WEZTERM_PANE"):
         return {"kind": "wezterm", "socket": g("WEZTERM_UNIX_SOCKET"), "pane": g("WEZTERM_PANE")}
     return None
 
@@ -218,11 +222,10 @@ class Discovery:
                     sock = row["socket"]
             key = host + ":" + session
             entry = found.setdefault(key, {"host": host, "session": session, "socket": sock, "herdr_bin": herdr_bin, "windows": []})
-            hint = terminal_hint(pid)
             for win in windows_for(pid):
                 if win["address"] in [w["address"] for w in entry["windows"]]:
                     continue
-                win["terminal"] = hint
+                win["terminal"] = terminal_hint(pid, win.get("class"))
                 win["shared_pid"] = len(clients.get(win["pid"], [])) > 1
                 entry["windows"].append(win)
 
