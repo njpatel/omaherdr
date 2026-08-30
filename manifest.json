@@ -6,7 +6,7 @@
   "author": "Neil Patel",
   "license": "Apache-2.0",
   "description": "TUI-style panel for herdr: every session you are attached to from this desktop, its spaces, tabs and agents with live status, and one keypress to jump to any of them.",
-  "preview": "assets/omaherdr.png",
+  "preview": "preview.png",
   "kinds": [
     "bar-widget"
   ],
