@@ -202,6 +202,11 @@ Panel {
     function filter(text: string): string { root.filter = text; return root.filter }
     function metric(name: string): string { root.barMetric = name; return root.barMetric }
     function style(name: string): string { root.barStyle = name; return root.barStyle }
+    // Widget rectangle on the bar in logical monitor coordinates (screenshots).
+    function barGeometry(): string {
+      var p = row.mapToItem(null, 0, 0)
+      return JSON.stringify({ x: p.x, y: p.y, w: row.width, h: row.height })
+    }
     function metrics(): string {
       return JSON.stringify({ lines: root.rows.length, textImplicit: tuiText.implicitHeight, textHeight: tuiText.height,
                               flickContent: panelFlick.contentHeight, flickHeight: panelFlick.height, panelContent: panel.contentHeight })

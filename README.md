@@ -26,6 +26,8 @@ Nothing to configure. Omaherdr finds every `herdr` you are attached to from this
 
 The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green; `active` adds yellow; `all` adds grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
 
+![Bar states](assets/bar.png)
+
 | key | |
 |---|---|
 | `j` `k` | move |
