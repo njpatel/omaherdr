@@ -24,7 +24,7 @@ Nothing to configure. Omaherdr finds every `herdr` you are attached to from this
 
 ## Use
 
-The bar shows the icon, plus `!N` agents waiting for input and `✓N` agents that finished while you were elsewhere. Nothing beside the icon means nothing needs you. Click the icon or the counts to open the panel.
+The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green only; `all` adds yellow and grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
 
 | key | |
 |---|---|

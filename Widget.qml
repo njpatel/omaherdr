@@ -61,6 +61,29 @@ Panel {
   readonly property color hilite: Qt.rgba(fg.r, fg.g, fg.b, 0.10)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Traffic lights: red / yellow / green from the theme's colors.toml (the
+  // shell only exposes foreground/accent/urgent), muted grey for idle.
+  property var palette: ({})
+  readonly property color red: palette.red || urgent
+  readonly property color yellow: palette.yellow || accent
+  readonly property color green: palette.green || accent
+  readonly property color grey: Color.muted || dim
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.parsePalette(text())
+  }
+  function parsePalette(content) {
+    var out = ({}), lines = String(content || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var m = lines[i].match(/^\s*([a-z_]+)\s*=\s*"(#[0-9a-fA-F]{6,8})"/)
+      if (m) out[m[1]] = m[2]
+    }
+    root.palette = out
+  }
+
   // ---------------------------------------------------------------- state
   property var snap: null
   property bool scrub: false
@@ -93,7 +116,7 @@ Panel {
     return st === "blocked" ? "!" : st === "done" ? "✓" : st === "working" ? "⠴" : st === "idle" ? "·" : st === "unknown" ? "?" : "—"
   }
   function statusColor(st) {
-    return st === "blocked" ? urgent : st === "done" ? accent : st === "working" ? fg : dim
+    return st === "blocked" ? red : st === "done" ? green : st === "working" ? yellow : st === "idle" ? grey : dim
   }
   function statusText(st) {
     return st === "blocked" ? "needs input" : st === "done" ? "done" : st === "working" ? "working" : st === "idle" ? "idle" : st === "unknown" ? "unknown" : ""
@@ -169,6 +192,7 @@ Panel {
     function scrub(): string { root.scrub = !root.scrub; return root.scrub ? "scrubbed" : "clear" }
     function view(): string { root.toggleView(); return root.viewMode }
     function filter(text: string): string { root.filter = text; return root.filter }
+    function metric(name: string): string { root.barMetric = name; return root.barMetric }
     function metrics(): string {
       return JSON.stringify({ lines: root.rows.length, textImplicit: tuiText.implicitHeight, textHeight: tuiText.height,
                               flickContent: panelFlick.contentHeight, flickHeight: panelFlick.height, panelContent: panel.contentHeight })
@@ -290,10 +314,10 @@ Panel {
     }
 
     // Summary: one cell per status, blocked first.
-    out += line(cat(cell("!", 1, urgent), gap(1), cell((c.blocked || 0) + " need input", 13, (c.blocked || 0) > 0 ? urgent : dim), gap(1),
-                    cell("✓", 1, accent), gap(1), cell((c.done || 0) + " done", 9, (c.done || 0) > 0 ? accent : dim), gap(1),
-                    cell("⠴", 1, fg), gap(1), cell((c.working || 0) + " working", 11, (c.working || 0) > 0 ? fg : dim), gap(1),
-                    cell("·", 1, dim), gap(1), cell((c.idle || 0) + " idle", 9, dim)))
+    out += line(cat(cell("■", 1, red), gap(1), cell((c.blocked || 0) + " need input", 13, (c.blocked || 0) > 0 ? fg : dim), gap(1),
+                    cell("■", 1, yellow), gap(1), cell((c.working || 0) + " working", 11, (c.working || 0) > 0 ? fg : dim), gap(1),
+                    cell("■", 1, green), gap(1), cell((c.done || 0) + " done", 9, (c.done || 0) > 0 ? fg : dim), gap(1),
+                    cell("■", 1, grey), gap(1), cell((c.idle || 0) + " idle", 9, dim)))
 
     var jumpIdx = 0
     for (var s = 0; s < servers.length; s++) {
@@ -464,17 +488,21 @@ Panel {
   }
 
   // ---------------------------------------------------------------- bar
-  readonly property string barText: {
-    if (!snap || barMetric === "none") return ""
-    var c = counts, parts = []
-    if ((c.blocked || 0) > 0) parts.push("!" + c.blocked)
-    if ((c.done || 0) > 0) parts.push("✓" + c.done)
-    if (barMetric === "all") {
-      if ((c.working || 0) > 0) parts.push("⠴" + c.working)
-      if ((c.idle || 0) > 0) parts.push("·" + c.idle)
+  // Lights, top to bottom like a traffic light. Icon-only mode stacks the
+  // lit ones beside the icon; the number modes give each its own count.
+  readonly property var lightOrder: ["blocked", "working", "done", "idle"]
+  function lightsFor(keys) {
+    var out = []
+    for (var i = 0; i < lightOrder.length; i++) {
+      var k = lightOrder[i]
+      if (keys.indexOf(k) >= 0 && (counts[k] || 0) > 0) out.push({ key: k, count: counts[k], color: statusColor(k) })
     }
-    return parts.join(" ")
+    return out
   }
+  readonly property var stackLights: snap ? lightsFor(["blocked", "working", "done"]) : []
+  readonly property var comboLights: !snap || barMetric === "none" ? [] :
+    lightsFor(barMetric === "all" ? ["blocked", "working", "done", "idle"] : ["blocked", "done"])
+  readonly property int dot: Math.round(Style.font.caption * 0.5)
   readonly property string barTooltip: {
     var c = counts
     if (!snap) return "Omaherdr"
@@ -489,23 +517,55 @@ Panel {
     id: row
     anchors.centerIn: parent
 
+    // Icon-only mode: a vertical stack of the lit lights, left of the icon.
+    Item {
+      id: stack
+      visible: root.barMetric === "none" && root.stackLights.length > 0 && !(root.bar && root.bar.vertical)
+      width: visible ? root.dot + Style.space(4) : 0
+      height: row.height
+      Column {
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 2
+        Repeater {
+          model: root.stackLights
+          Rectangle { width: root.dot; height: root.dot; radius: 1; color: modelData.color }
+        }
+      }
+    }
+
     BarIconButton {
       id: button
       bar: root.bar
       text: root.barIcon
-      active: root.alarming
       onPressed: function(buttonCode) { root.barPressed(buttonCode) }
     }
 
-    Text {
+    // Number modes: one light and its count per state, spaced to scan.
+    Item {
       id: metric
-      anchors.verticalCenter: parent.verticalCenter
-      visible: !(root.bar && root.bar.vertical) && root.barText !== ""
-      text: root.barText
-      color: root.alarming ? root.urgent : (root.attention ? root.accent : (root.bar ? root.bar.barForeground : root.fg))
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      rightPadding: Style.space(6)
+      visible: !(root.bar && root.bar.vertical) && root.comboLights.length > 0
+      width: visible ? combos.width + Style.space(6) : 0
+      height: row.height
+
+      Row {
+        id: combos
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(8)
+        Repeater {
+          model: root.comboLights
+          Row {
+            spacing: Style.space(4)
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: root.dot; height: root.dot; radius: 1; color: modelData.color }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.count
+              color: root.bar ? root.bar.barForeground : root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+      }
 
       MouseArea {
         anchors.fill: parent
