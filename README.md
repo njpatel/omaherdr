@@ -24,7 +24,7 @@ Nothing to configure. Omaherdr finds every `herdr` you are attached to from this
 
 ## Use
 
-The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green only; `all` adds yellow and grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
+The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green; `active` adds yellow; `all` adds grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
 
 | key | |
 |---|---|
@@ -33,9 +33,9 @@ The bar shows the icon with traffic lights: red for agents waiting for input, ye
 | `Enter` / click | jump: focuses the terminal window, then the space, tab or agent inside herdr |
 | `v` | agents (most urgent first) / spaces (every space with its tabs) |
 | `h` | redact names |
-| `r` | cycle what the bar shows: attention, all, none |
-| `i` | lights / inverse: a square beside each count, or the count on a pill of that colour (icon-only mode paints the colours behind the icon) |
-| `I` | cycle the bar icon |
+| `r` | cycle what the bar shows: attention, active, all, none |
+| `l` | lights / inverse: a square beside each count, or the count on a pill of that colour (icon-only mode paints the colours behind the icon) |
+| `i` | cycle the bar icon |
 | `R` | refresh |
 
 Status is live: the daemon subscribes to herdr's events, so the bar flips the moment an agent blocks on a question or finishes. `since` is how long the agent has been in its current state, as observed from here. Settings live on the bar entry: `omarchy bar set njpatel.omaherdr barMetric all` (or `barIcon`, `view`).

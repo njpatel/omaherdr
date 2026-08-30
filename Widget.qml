@@ -9,7 +9,7 @@ import qs.Ui
 // to from this desktop. bin/omaherdr-daemon finds the sessions, follows their
 // servers live and streams one JSON state per change; this file renders it and
 // sends jump commands back. Keys: j/k move · Enter jump · v spaces/agents ·
-// h redact · r cycle the bar text · i cycle the bar icon · R refresh · Esc close.
+// h redact · r cycle the bar text · l lights/inverse · i cycle the bar icon · R refresh · Esc close.
 
 Panel {
   id: root
@@ -19,7 +19,7 @@ Panel {
 
   // ---------------------------------------------------------------- settings
   property string barMetric: String(setting("barMetric", "attention"))
-  readonly property var barMetrics: ["attention", "all", "none"]
+  readonly property var barMetrics: ["attention", "active", "all", "none"]
   function cycleBarMetric() {
     barMetric = barMetrics[(barMetrics.indexOf(barMetric) + 1) % barMetrics.length]
     Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "barMetric", barMetric])
@@ -348,7 +348,7 @@ Panel {
 
     out += rule("", false, false)
     out += line(cell("j/k move · ⏎ jump · / filter · h hide · R refresh", inner, dim))
-    out += line(cell("v " + viewMode + " · r " + barMetric + " · i " + barStyle + " · I " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
+    out += line(cell("v " + viewMode + " · r " + barMetric + " · l " + barStyle + " · i " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
     if (filtering || filter) out += line(cat(cell("/ " + filter, inner - 2, accent), cell(filtering ? "▏" : "", 2, accent)))
     out += rule("", false, true)
     return finish(out)
@@ -511,7 +511,7 @@ Panel {
   }
   readonly property var stackLights: snap ? lightsFor(["blocked", "working", "done"]) : []
   readonly property var comboLights: !snap || barMetric === "none" ? [] :
-    lightsFor(barMetric === "all" ? ["blocked", "working", "done", "idle"] : ["blocked", "done"])
+    lightsFor(barMetric === "all" ? ["blocked", "working", "done", "idle"] : barMetric === "active" ? ["blocked", "working", "done"] : ["blocked", "done"])
   readonly property int dot: Math.round(Style.font.caption * 0.55)
   readonly property string barTooltip: {
     var c = counts
@@ -569,7 +569,7 @@ Panel {
         anchors.centerIn: parent
         width: button.opticalSize + Style.space(8)
         height: root.pillHeight
-        radius: Style.space(3)
+        radius: 2
         color: "transparent"
         clip: true
         Column {
@@ -609,7 +609,7 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               width: count.implicitWidth + Style.space(8)
               height: root.pillHeight
-              radius: Style.space(3)
+              radius: 2
               color: modelData.color
             }
             Rectangle {
@@ -673,6 +673,7 @@ Panel {
 
       onMoveRequested: function(dx, dy) {
         if (dx < 0) root.scrub = !root.scrub
+        if (dx > 0) root.toggleBarStyle()
         if (dy !== 0) root.moveCursor(dy)
       }
       onActivateRequested: root.activateCursor()
@@ -683,8 +684,7 @@ Panel {
         else if (t === "r") root.cycleBarMetric()
         else if (t === "R") root.refresh()
         else if (t === "v" || t === "V") root.toggleView()
-        else if (t === "i") root.toggleBarStyle()
-        else if (t === "I") root.cycleBarIcon()
+        else if (t === "i" || t === "I") root.cycleBarIcon()
         else if (t === "g") { root.cursor = 0; panelFlick.contentY = 0 }
         else if (t === "G") { root.moveCursor(root.jumps.length) }
       }

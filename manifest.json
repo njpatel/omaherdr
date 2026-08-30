@@ -36,11 +36,12 @@
         "label": "Lights shown beside the icon",
         "options": [
           "attention",
+          "active",
           "all",
           "none"
         ],
         "defaultValue": "attention",
-        "description": "attention = red (needs input) and green (done) with counts, hidden when there are none; all = also yellow (working) and grey (idle); none = icon only, with the lit lights stacked beside it."
+        "description": "attention = red (needs input) and green (done); active = also yellow (working); all = also grey (idle); none = icon only, with the lit lights stacked beside it. Counts are hidden when zero."
       },
       {
         "key": "barStyle",
