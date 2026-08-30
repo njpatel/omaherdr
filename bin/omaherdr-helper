@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# omaherdr-helper — one herdr server, spoken to over its unix socket.
+#
+#   omaherdr-helper <socket-path>
+#
+# Runs next to the server (locally, or on the far end of an ssh session) and
+# bridges it to stdin/stdout as JSON lines:
+#
+#   stdin   snapshot                  → {"kind":"snapshot","ok":true,"snapshot":{...}}
+#           rpc <json request>        → {"kind":"rpc","id":...,"result"|"error":...}
+#           quit
+#   stdout  {"kind":"event","event":"pane_agent_status_changed","data":{...}}
+#           {"kind":"status","connected":bool,"message":...}
+#
+# The herdr API serves exactly one request per connection, except
+# `events.subscribe`, which keeps its connection open and streams. So each
+# request opens a fresh socket, and one long-lived socket carries the
+# subscription. Only stdlib, so it can be shipped to a remote host inline.
+import json
+import os
+import select
+import socket
+import sys
+import time
+
+SOCK = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.config/herdr/herdr.sock")
+
+# Structural events (no params) plus the per-pane status stream.
+STRUCTURAL = [
+    "workspace.created", "workspace.updated", "workspace.renamed", "workspace.moved",
+    "workspace.reordered", "workspace.closed", "workspace.focused",
+    "tab.created", "tab.closed", "tab.focused", "tab.renamed", "tab.moved",
+    "pane.created", "pane.closed", "pane.focused", "pane.moved", "pane.exited",
+    "pane.agent_detected", "layout.updated",
+]
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def request(method, params, timeout=8.0):
+    """One request, one connection. Returns the parsed response object."""
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK)
+        s.sendall((json.dumps({"id": "omaherdr", "method": method, "params": params}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        return json.loads(line) if line else {"error": {"code": "empty", "message": "empty response"}}
+    finally:
+        s.close()
+
+
+class Subscription:
+    def __init__(self):
+        self.sock = None
+        self.buf = b""
+        self.panes = set()
+        self.retry_at = 0.0
+        self.backoff = 1.0
+
+    def open(self, panes):
+        self.close()
+        subs = [{"type": t} for t in STRUCTURAL] + [{"type": "pane.agent_status_changed", "pane_id": p} for p in sorted(panes)]
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(8.0)
+        s.connect(SOCK)
+        s.sendall((json.dumps({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": subs}}) + "\n").encode())
+        s.setblocking(False)
+        self.sock = s
+        self.buf = b""
+        self.panes = set(panes)
+        self.backoff = 1.0
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def read(self):
+        """Drain readable data; yield decoded event lines. Returns False on EOF."""
+        try:
+            chunk = self.sock.recv(1 << 20)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        self.buf += chunk
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if "event" in obj:
+                emit({"kind": "event", "event": obj.get("event"), "data": obj.get("data")})
+            elif "error" in obj:
+                emit({"kind": "status", "connected": False, "message": "subscribe: " + str(obj["error"].get("message", obj["error"]))})
+                return False
+        return True
+
+
+def snapshot(sub):
+    try:
+        resp = request("session.snapshot", {})
+    except OSError as e:
+        emit({"kind": "snapshot", "ok": False, "error": str(e)})
+        return None
+    if "error" in resp:
+        emit({"kind": "snapshot", "ok": False, "error": resp["error"].get("message", str(resp["error"]))})
+        return None
+    snap = (resp.get("result") or {}).get("snapshot") or {}
+    emit({"kind": "snapshot", "ok": True, "snapshot": snap})
+    panes = {p.get("pane_id") for p in snap.get("panes", []) if p.get("pane_id")}
+    # Status subscriptions are per pane: re-subscribe when the pane set moves.
+    if sub.sock is None or panes != sub.panes:
+        try:
+            sub.open(panes)
+            emit({"kind": "status", "connected": True, "message": "subscribed to %d panes" % len(panes)})
+        except OSError as e:
+            sub.close()
+            sub.retry_at = time.time() + sub.backoff
+            emit({"kind": "status", "connected": False, "message": "subscribe: " + str(e)})
+    return snap
+
+
+def main():
+    sub = Subscription()
+    snapshot(sub)
+    stdin = sys.stdin.buffer
+    inbuf = b""
+    while True:
+        fds = [stdin]
+        if sub.sock:
+            fds.append(sub.sock)
+        timeout = 2.0 if sub.sock else max(0.2, sub.retry_at - time.time())
+        try:
+            ready, _, _ = select.select(fds, [], [], timeout)
+        except InterruptedError:
+            continue
+        if sub.sock and sub.sock in ready:
+            if not sub.read():
+                sub.close()
+                sub.backoff = min(30.0, sub.backoff * 2)
+                sub.retry_at = time.time() + sub.backoff
+                emit({"kind": "status", "connected": False, "message": "subscription closed; retrying"})
+        if stdin in ready:
+            chunk = os.read(stdin.fileno(), 65536)
+            if not chunk:
+                return
+            inbuf += chunk
+            while b"\n" in inbuf:
+                line, inbuf = inbuf.split(b"\n", 1)
+                cmd = line.decode(errors="replace").strip()
+                if cmd == "quit":
+                    return
+                if cmd == "snapshot":
+                    snapshot(sub)
+                elif cmd.startswith("rpc "):
+                    try:
+                        req = json.loads(cmd[4:])
+                        resp = request(req.get("method"), req.get("params") or {})
+                        emit({"kind": "rpc", "id": req.get("id"), "method": req.get("method"),
+                              "result": resp.get("result"), "error": resp.get("error")})
+                    except (ValueError, OSError) as e:
+                        emit({"kind": "rpc", "id": None, "error": {"message": str(e)}})
+        if sub.sock is None and time.time() >= sub.retry_at:
+            # Server gone or restarted: a fresh snapshot both reports the state and re-subscribes.
+            snapshot(sub)
+            if sub.sock is None:
+                sub.backoff = min(30.0, sub.backoff * 2)
+                sub.retry_at = time.time() + sub.backoff
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

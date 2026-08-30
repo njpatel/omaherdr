@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "njpatel.omaherdr",
+  "name": "Omaherdr",
+  "version": "1.0.0",
+  "author": "Neil Patel",
+  "license": "Apache-2.0",
+  "description": "TUI-style panel for herdr: every session you are attached to from this desktop, its spaces, tabs and agents with live status, and one keypress to jump to any of them.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omaherdr",
+    "description": "Agents waiting for input or done in the bar; a panel listing spaces, tabs and agents across every attached herdr (local or --remote) that jumps to the right terminal window and target.",
+    "category": "AI",
+    "aliases": ["omaherdr", "herdr"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barMetric": "attention",
+      "barIcon": "robot",
+      "view": "agents"
+    },
+    "schema": [
+      { "key": "barMetric", "type": "enum", "label": "Text shown beside the icon", "options": ["attention", "all", "none"], "defaultValue": "attention", "description": "attention = agents needing input (!) and done (✓), hidden when there are none; all = also working (⠴) and idle (·); none = icon only." },
+      { "key": "barIcon", "type": "string", "label": "Bar icon", "defaultValue": "robot", "description": "A name (robot, robot-happy, console, terminal, brain, group, dashboard, flag, bell, server, lan, chip, pulse) or any Nerd Font glyph." },
+      { "key": "view", "type": "enum", "label": "Panel view", "options": ["agents", "spaces"], "defaultValue": "agents", "description": "agents = one row per agent, most urgent first; spaces = every space with its tabs." }
+    ]
+  }
+}

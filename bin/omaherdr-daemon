@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+# omaherdr-daemon — finds every herdr the user is attached to from this desktop,
+# follows each server live, and streams one merged JSON state per change.
+#
+# Started by Widget.qml (stdout → the panel, stdin ← the panel):
+#
+#   stdout  {"generated_ts":…, "counts":{…}, "servers":[…]}       one line per change
+#   stdin   refresh                                               re-snapshot every server
+#           go <server-key> <ws|tab|pane> <id>                    focus the terminal window, then the target
+#           quit
+#
+# Discovery is by process: any `herdr` TUI client running on this machine
+# (plain, --session NAME, --remote TARGET, `session attach NAME`) is walked up
+# to the Hyprland window that hosts it, so the panel can jump straight to the
+# right terminal. A local server that is running with nobody attached is
+# listed too (no window to jump to). Remote servers are reached over ssh with
+# the same target string the user typed; omaherdr-helper is shipped inline.
+import base64
+import json
+import os
+import queue
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HELPER = os.path.join(HERE, "omaherdr-helper")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy", "omaherdr")
+SINCE_FILE = os.path.join(STATE_DIR, "since.json")
+DEFAULT_SOCK = "~/.config/herdr/herdr.sock"
+SCAN_EVERY = 5.0
+SNAPSHOT_EVERY = 60.0
+DEBOUNCE = 0.25
+
+events = queue.Queue()
+
+
+def log(*a):
+    sys.stderr.write("omaherdr: " + " ".join(str(x) for x in a) + "\n")
+    sys.stderr.flush()
+
+
+def run(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# ------------------------------------------------------------------ discovery
+def hypr_clients():
+    out = run(["hyprctl", "clients", "-j"])
+    try:
+        return {c["pid"]: c for c in json.loads(out) if c.get("pid")}
+    except ValueError:
+        return {}
+
+
+def proc_table():
+    """pid → (ppid, argv)"""
+    table = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                stat = f.read()
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        table[pid] = (ppid, argv)
+    return table
+
+
+def parse_attachment(argv):
+    """A herdr TUI client? → {"remote": target|None, "session": name|None}; else None."""
+    if not argv or os.path.basename(argv[0]) != "herdr":
+        return None
+    remote, session, positional = None, None, []
+    takes_value = {"--remote", "--session", "--remote-keybindings"}
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in takes_value:
+            val = argv[i + 1] if i + 1 < len(argv) else None
+            if a == "--remote":
+                remote = val
+            elif a == "--session":
+                session = val
+            i += 2
+            continue
+        if a.startswith("--remote="):
+            remote = a.split("=", 1)[1]
+        elif a.startswith("--session="):
+            session = a.split("=", 1)[1]
+        elif a == "--no-session":
+            return None  # monolithic: no server, no API
+        elif a.startswith("-"):
+            pass
+        else:
+            positional.append(a)
+        i += 1
+    if positional[:2] == ["session", "attach"] and len(positional) >= 3:
+        session = positional[2]
+    elif positional:
+        return None  # `herdr client`, `herdr server`, CLI subcommands…
+    return {"remote": remote, "session": session}
+
+
+def parse_session_list(text):
+    """`herdr session list` → {name: {"status":…, "socket":…}}"""
+    rows = {}
+    for line in text.splitlines()[1:]:
+        cols = re.split(r"\s{2,}", line.strip())
+        if len(cols) >= 4:
+            rows[cols[0]] = {"status": cols[1], "socket": cols[3]}
+    return rows
+
+
+class Discovery:
+    def __init__(self):
+        self.session_cache = {}  # host → (ts, rows)
+
+    def sessions(self, host, herdr_bin):
+        ts, rows = self.session_cache.get(host, (0, {}))
+        if time.time() - ts < 60:
+            return rows
+        if host == "local":
+            text = run([herdr_bin, "session", "list"], 5)
+        else:
+            # Leave a leading ~ unquoted so the remote shell expands it.
+            binq = herdr_bin if re.fullmatch(r"[\w./~-]+", herdr_bin) else shlex.quote(herdr_bin)
+            text = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, binq + " session list"], 15)
+        rows = parse_session_list(text)
+        self.session_cache[host] = (time.time(), rows)
+        return rows
+
+    def scan(self):
+        """→ {server_key: {"host", "session", "socket", "herdr_bin", "windows": [...]}}"""
+        clients = hypr_clients()
+        procs = proc_table()
+        found = {}
+
+        def window_for(pid):
+            seen = 0
+            while pid > 1 and seen < 64:
+                if pid in clients:
+                    c = clients[pid]
+                    return {"address": c.get("address"), "workspace": (c.get("workspace") or {}).get("id"),
+                            "class": c.get("class"), "pid": pid}
+                pid = procs.get(pid, (0, None))[0]
+                seen += 1
+            return None
+
+        for pid, (ppid, argv) in procs.items():
+            att = parse_attachment(argv)
+            if not att:
+                continue
+            host = att["remote"] or "local"
+            session = att["session"] or "default"
+            herdr_bin = "herdr"
+            if host != "local":
+                # The ssh bridge child knows where herdr lives on the far side.
+                for cpid, (cppid, cargv) in procs.items():
+                    if cppid == pid and cargv and cargv[0] == "ssh":
+                        m = re.search(r"exec (\S+) remote-client-bridge", " ".join(cargv))
+                        if m:
+                            herdr_bin = m.group(1)
+                        break
+            sock = DEFAULT_SOCK
+            if session != "default":
+                row = self.sessions(host, herdr_bin).get(session)
+                if row and row.get("socket"):
+                    sock = row["socket"]
+            key = host + ":" + session
+            entry = found.setdefault(key, {"host": host, "session": session, "socket": sock, "herdr_bin": herdr_bin, "windows": []})
+            win = window_for(pid)
+            if win and win["address"] not in [w["address"] for w in entry["windows"]]:
+                entry["windows"].append(win)
+
+        # Local servers running with no client attached.
+        for name, row in self.sessions("local", "herdr").items():
+            key = "local:" + name
+            if row.get("status") == "running" and key not in found:
+                found[key] = {"host": "local", "session": name, "socket": row.get("socket") or DEFAULT_SOCK,
+                              "herdr_bin": "herdr", "windows": []}
+        return found
+
+
+# ------------------------------------------------------------------ helpers
+class Helper:
+    """One omaherdr-helper process, local or over ssh."""
+
+    def __init__(self, key, info):
+        self.key = key
+        self.info = info
+        self.proc = None
+        self.started = 0.0
+        self.attempts = 0
+        self.start()
+
+    def command(self):
+        if self.info["host"] == "local":
+            return [sys.executable, HELPER, self.info["socket"]]
+        with open(HELPER, "rb") as f:
+            code = base64.b64encode(f.read()).decode()
+        remote = "python3 -c \"import base64;exec(base64.b64decode('%s'))\" %s" % (code, shlex.quote(self.info["socket"]))
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=3", self.info["host"], remote]
+
+    def start(self):
+        self.started = time.time()
+        self.attempts += 1
+        try:
+            self.proc = subprocess.Popen(self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as e:
+            self.proc = None
+            events.put((self.key, {"kind": "status", "connected": False, "message": str(e)}))
+            return
+        threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self._pump_err, args=(self.proc,), daemon=True).start()
+
+    def _pump(self, proc):
+        for line in proc.stdout:
+            try:
+                events.put((self.key, json.loads(line)))
+            except ValueError:
+                pass
+        code = proc.wait()
+        events.put((self.key, {"kind": "exit", "code": code}))
+
+    def _pump_err(self, proc):
+        for line in proc.stderr:
+            line = line.strip()
+            if line:
+                log(self.key, line)
+
+    def send(self, text):
+        if not self.proc or self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write(text + "\n")
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.send("quit")
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+# ------------------------------------------------------------------ state
+PANE_FIELDS = ("pane_id", "tab_id", "workspace_id", "label", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd")
+AGENT_FIELDS = ("pane_id", "tab_id", "workspace_id", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd", "name")
+
+
+def slim(obj, fields):
+    return {k: obj.get(k) for k in fields if k in obj}
+
+
+class Server:
+    def __init__(self, key, info):
+        self.key = key
+        self.info = info
+        self.ok = False
+        self.error = None
+        self.connected = False
+        self.snapshot = None
+        self.status = {}          # pane_id → last agent_status seen
+        self.since = {}           # pane_id → ts the status was first seen
+        self.want_snapshot_at = None
+        self.last_snapshot = 0.0
+
+    def apply_snapshot(self, msg, now):
+        if not msg.get("ok"):
+            self.ok = False
+            self.error = msg.get("error") or "unavailable"
+            return
+        snap = msg.get("snapshot") or {}
+        self.ok = True
+        self.error = None
+        self.last_snapshot = now
+        panes = [slim(p, PANE_FIELDS) for p in snap.get("panes", [])]
+        agents = [slim(a, AGENT_FIELDS) for a in snap.get("agents", [])]
+        live = set()
+        for p in panes:
+            if not p.get("agent"):
+                continue
+            live.add(p["pane_id"])
+            self.note_status(p["pane_id"], p.get("agent_status"), now)
+        for pid in list(self.status):
+            if pid not in live:
+                self.status.pop(pid, None)
+                self.since.pop(pid, None)
+        self.snapshot = {
+            "version": snap.get("version"),
+            "focused_workspace_id": snap.get("focused_workspace_id"),
+            "focused_tab_id": snap.get("focused_tab_id"),
+            "focused_pane_id": snap.get("focused_pane_id"),
+            "workspaces": snap.get("workspaces", []),
+            "tabs": snap.get("tabs", []),
+            "panes": panes,
+            "agents": agents,
+        }
+
+    def note_status(self, pane_id, status, now):
+        if self.status.get(pane_id) != status:
+            self.status[pane_id] = status
+            self.since[pane_id] = now
+
+    def apply_event(self, msg, now):
+        """Cheap in-place update so the bar flips immediately; a snapshot follows."""
+        ev, data = msg.get("event"), msg.get("data") or {}
+        if ev == "pane_agent_status_changed" and self.snapshot:
+            pid, st = data.get("pane_id"), data.get("agent_status")
+            for coll in ("panes", "agents"):
+                for p in self.snapshot[coll]:
+                    if p.get("pane_id") == pid:
+                        p["agent_status"] = st
+            self.note_status(pid, st, now)
+        self.want_snapshot_at = now + DEBOUNCE
+
+    def view(self):
+        return {
+            "key": self.key, "host": self.info["host"], "session": self.info["session"],
+            "label": self.info["host"] if self.info["host"] != "local" else os.uname().nodename,
+            "ok": self.ok, "error": self.error, "connected": self.connected,
+            "windows": self.info.get("windows", []),
+            "snapshot": self.snapshot,
+            "since": self.since,
+            "snapshot_ts": self.last_snapshot,
+        }
+
+
+def counts(servers):
+    c = {"blocked": 0, "done": 0, "working": 0, "idle": 0, "unknown": 0, "agents": 0, "servers": 0, "windows": 0}
+    for s in servers:
+        if not s.ok or not s.snapshot:
+            continue
+        c["servers"] += 1
+        c["windows"] += len(s.info.get("windows", []))
+        for a in s.snapshot["agents"]:
+            st = a.get("agent_status") or "unknown"
+            c[st if st in c else "unknown"] += 1
+            c["agents"] += 1
+    return c
+
+
+def load_since():
+    try:
+        with open(SINCE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_since(servers):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        data = {s.key: {"status": s.status, "since": s.since} for s in servers.values()}
+        tmp = SINCE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, SINCE_FILE)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ main
+def stdin_reader():
+    for line in sys.stdin:
+        events.put(("_stdin", line.strip()))
+    events.put(("_stdin", "quit"))
+
+
+def emit(servers, discovered_ts):
+    views = [servers[k].view() for k in sorted(servers)]
+    out = {"generated_ts": time.time(), "scan_ts": discovered_ts, "counts": counts(list(servers.values())), "servers": views}
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    discovery = Discovery()
+    servers, helpers = {}, {}
+    remembered = load_since()
+    threading.Thread(target=stdin_reader, daemon=True).start()
+
+    last_scan = 0.0
+    dirty_at = None
+    scan_ts = 0.0
+
+    while True:
+        now = time.time()
+        if now - last_scan >= SCAN_EVERY:
+            last_scan = now
+            found = discovery.scan()
+            scan_ts = now
+            for key in list(servers):
+                if key not in found:
+                    helpers.pop(key).stop()
+                    servers.pop(key)
+                    dirty_at = now
+            for key, info in found.items():
+                if key not in servers:
+                    servers[key] = Server(key, info)
+                    mem = remembered.get(key)
+                    if mem:
+                        servers[key].status = dict(mem.get("status", {}))
+                        servers[key].since = dict(mem.get("since", {}))
+                    helpers[key] = Helper(key, info)
+                    dirty_at = now
+                elif servers[key].info.get("windows") != info.get("windows"):
+                    servers[key].info["windows"] = info.get("windows", [])
+                    dirty_at = now
+            # Safety net: periodic full snapshots.
+            for key, s in servers.items():
+                if s.ok and now - s.last_snapshot > SNAPSHOT_EVERY:
+                    helpers[key].send("snapshot")
+
+        # Helpers that died: restart with backoff (ssh drops, server restarts).
+        for key, h in helpers.items():
+            if h.proc is None or h.proc.poll() is not None:
+                wait = min(60.0, 2.0 * (2 ** min(h.attempts, 5)))
+                if now - h.started >= wait:
+                    h.start()
+
+        for key, s in servers.items():
+            if s.want_snapshot_at is not None and now >= s.want_snapshot_at:
+                s.want_snapshot_at = None
+                helpers[key].send("snapshot")
+
+        try:
+            key, msg = events.get(timeout=0.2)
+        except queue.Empty:
+            key, msg = None, None
+
+        if key == "_stdin":
+            cmd = msg.split()
+            if not cmd:
+                pass
+            elif cmd[0] == "quit":
+                break
+            elif cmd[0] == "refresh":
+                last_scan = 0.0
+                for h in helpers.values():
+                    h.send("snapshot")
+            elif cmd[0] == "go" and len(cmd) >= 4:
+                skey, kind, target = cmd[1], cmd[2], cmd[3]
+                s = servers.get(skey)
+                if s:
+                    wins = s.info.get("windows") or []
+                    if wins:
+                        subprocess.run(["hyprctl", "dispatch", "focuswindow", "address:" + str(wins[0]["address"])],
+                                       capture_output=True)
+                    method, params = {
+                        "ws": ("workspace.focus", {"workspace_id": target}),
+                        "tab": ("tab.focus", {"tab_id": target}),
+                        "pane": ("pane.focus", {"pane_id": target}),
+                    }.get(kind, (None, None))
+                    if method:
+                        helpers[skey].send("rpc " + json.dumps({"id": "go", "method": method, "params": params}))
+        elif key in servers:
+            s = servers[key]
+            kind = msg.get("kind")
+            if kind == "snapshot":
+                s.apply_snapshot(msg, time.time())
+                s.connected = s.ok
+                dirty_at = time.time()
+                save_since(servers)
+            elif kind == "event":
+                s.apply_event(msg, time.time())
+                dirty_at = time.time()
+            elif kind == "status":
+                s.connected = bool(msg.get("connected"))
+                if not s.connected and msg.get("message"):
+                    log(key, msg["message"])
+                dirty_at = time.time()
+            elif kind == "rpc":
+                if msg.get("error"):
+                    log(key, "rpc", msg.get("method"), msg["error"])
+            elif kind == "exit":
+                s.connected = False
+                s.ok = False
+                s.error = "helper exited (%s)" % msg.get("code")
+                dirty_at = time.time()
+
+        if dirty_at is not None and time.time() - dirty_at >= 0.05:
+            emit(servers, scan_ts)
+            dirty_at = None
+
+    for h in helpers.values():
+        h.stop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
