@@ -196,6 +196,9 @@ Panel {
   }
 
   IpcHandler {
+    // Omarchy instantiates a bar widget more than once; without this both
+    // copies register the same target and the loser silently drops every call.
+    enabled: root.bar !== null
     target: root.ipcTarget
     function open(): void { root.open() }
     function close(): void { root.close() }
