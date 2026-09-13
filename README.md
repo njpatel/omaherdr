@@ -26,6 +26,8 @@ Nothing to configure. Omaherdr finds every `herdr` you are attached to from this
 
 Remove with `omarchy plugin remove njpatel.omaherdr`; it leaves nothing behind except `~/.local/state/omarchy/omaherdr/` (delete it if you like). Needs herdr 0.8 or newer and `python3`; for `--remote` hosts, an SSH key that works non-interactively and `python3` there too. No other dependencies.
 
+Local discovery, live agent status and workspace jumps have been checked with herdr 0.9.0; snapshot and event handling also work with 0.8.2. Herdr 0.9's saved machines (`herdr machine add`) are not discovered or selected by Omaherdr: use a separate `herdr --remote HOST` client for remote sessions. The public focus API is session-wide, so a jump also changes other clients attached to that server rather than preserving their independent views.
+
 ## Use
 
 The bar shows the icon with traffic lights: red for agents waiting for input, yellow for working, green for done, grey for idle (colours come from your theme). By default each lit state gets a light and its count (`attention` = red and green; `active` adds yellow; `all` adds grey); in icon-only mode the lit lights stack beside the icon. No lights means nothing needs you. Click the icon or the counts to open the panel.
@@ -62,7 +64,7 @@ Anything else gets the window. Windows are matched from the client's process tre
 
 ## How it works
 
-`bin/omaherdr-daemon` scans processes every 10 s, maps each herdr client to its Hyprland window, and runs one `bin/omaherdr-helper` per server (shipped inline over ssh for remote hosts). The helper takes a `session.snapshot`, subscribes to workspace, tab, pane and per-pane agent-status events, and streams them back; the daemon folds everything into one JSON state per change, which `Widget.qml` renders. Jumps go the other way: `focuswindow` in Hyprland, then the terminal tab that hosts the client (kitty via its remote control, WezTerm via `wezterm cli`; foot and Alacritty have no tabs, so the window is enough; Ghostty and `foot --server` run every window from one process, so the window is picked by its herdr title), then `workspace.focus` / `tab.focus` / `pane.focus` on the right server.
+`bin/omaherdr-daemon` scans processes every 10 s, maps each herdr client to its Hyprland window, and runs one `bin/omaherdr-helper` per server (shipped inline over ssh for remote hosts). The helper subscribes to workspace, tab and pane events, waits for acknowledgement, then takes a `session.snapshot`. It adds per-pane agent-status subscriptions and takes another snapshot after each subscription change, covering changes while a stream is replaced. The daemon folds the snapshots and live events into one JSON state per change, which `Widget.qml` renders. Jumps go the other way: `focuswindow` in Hyprland, then the terminal tab that hosts the client (kitty via its remote control, WezTerm via `wezterm cli`; foot and Alacritty have no tabs, so the window is enough; Ghostty and `foot --server` run every window from one process, so the window is picked by its herdr title), then `workspace.focus` / `tab.focus` / `pane.focus` on the right server.
 
 ## License
 

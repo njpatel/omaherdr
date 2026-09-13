@@ -370,7 +370,7 @@ class Server:
     def apply_event(self, msg, now):
         """Cheap in-place update so the bar flips immediately; a snapshot follows."""
         ev, data = msg.get("event"), msg.get("data") or {}
-        if ev == "pane_agent_status_changed" and self.snapshot:
+        if ev == "pane.agent_status_changed" and self.snapshot:
             pid, st = data.get("pane_id"), data.get("agent_status")
             for coll in ("panes", "agents"):
                 for p in self.snapshot[coll]:
