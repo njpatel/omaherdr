@@ -68,6 +68,16 @@ Anything else gets the window. Windows are matched from the client's process tre
 
 `bin/omaherdr-daemon` scans processes every 10 s, maps each herdr client to its Hyprland window, and runs one `bin/omaherdr-helper` per server (shipped inline over ssh for remote hosts). The helper subscribes to workspace, tab and pane events, waits for acknowledgement, then takes a `session.snapshot`. It adds per-pane agent-status subscriptions and takes another snapshot after each subscription change, covering changes while a stream is replaced. The daemon folds the snapshots and live events into one JSON state per change, which `Widget.qml` renders. Jumps go the other way: `focuswindow` in Hyprland, then the terminal tab that hosts the client (kitty via its remote control, WezTerm via `wezterm cli`; foot and Alacritty have no tabs, so the window is enough; Ghostty and `foot --server` run every window from one process, so the window is picked by its herdr title), then `workspace.focus` / `tab.focus` / `pane.focus` on the right server.
 
+## Development
+
+Run the focused event regressions with Python's standard library:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+These checks cover event delivery and status counts; they do not replace a real desktop and agent smoke test.
+
 ## License
 
 Apache-2.0
