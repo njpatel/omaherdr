@@ -26,7 +26,9 @@ Nothing to configure. Omaherdr finds every `herdr` you are attached to from this
 
 Remove with `omarchy plugin remove njpatel.omaherdr`; it leaves nothing behind except `~/.local/state/omarchy/omaherdr/` (delete it if you like). Needs herdr 0.8 or newer and `python3`; for `--remote` hosts, an SSH key that works non-interactively and `python3` there too. No other dependencies.
 
-Local discovery, live agent status and workspace jumps have been checked with herdr 0.9.0; snapshot and event handling also work with 0.8.2. Herdr 0.9's saved machines (`herdr machine add`) are not discovered or selected by Omaherdr: use a separate `herdr --remote HOST` client for remote sessions. The public focus API is session-wide, so a jump also changes other clients attached to that server rather than preserving their independent views.
+Local and standalone `--remote` discovery, live status and jumps have been checked with herdr 0.9.0 and foot 1.27.0, including a real OpenCode 1.18.30 agent completing background work and changing from done to idle when its row is clicked. Snapshot and event handling also work with herdr 0.8.2.
+
+Herdr 0.9's saved machines (`herdr machine add`) are not discovered or selected by Omaherdr: use a separate `herdr --remote HOST` client for remote sessions. When a combined client is showing a remote machine, even clicking a Local workspace in Omaherdr does not switch that client back to Local. The public focus API is session-wide, so a jump also changes other clients viewing that server rather than preserving their independent views.
 
 ## Use
 
