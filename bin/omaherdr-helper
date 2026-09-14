@@ -9,7 +9,7 @@
 #   stdin   snapshot                  → {"kind":"snapshot","ok":true,"snapshot":{...}}
 #           rpc <json request>        → {"kind":"rpc","id":...,"result"|"error":...}
 #           quit
-#   stdout  {"kind":"event","event":"pane_agent_status_changed","data":{...}}
+#   stdout  {"kind":"event","event":"pane.agent_status_changed","data":{...}}
 #           {"kind":"status","connected":bool,"message":...}
 #
 # The herdr API serves exactly one request per connection, except
@@ -66,19 +66,44 @@ class Subscription:
         self.panes = set()
         self.retry_at = 0.0
         self.backoff = 1.0
+        self.snapshot_pending = False
 
     def open(self, panes):
         self.close()
         subs = [{"type": t} for t in STRUCTURAL] + [{"type": "pane.agent_status_changed", "pane_id": p} for p in sorted(panes)]
         s = socket.socket(socket.AF_UNIX)
-        s.settimeout(8.0)
-        s.connect(SOCK)
-        s.sendall((json.dumps({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": subs}}) + "\n").encode())
-        s.setblocking(False)
+        try:
+            s.settimeout(8.0)
+            s.connect(SOCK)
+            s.sendall((json.dumps({"id": "sub", "method": "events.subscribe", "params": {"subscriptions": subs}}) + "\n").encode())
+            buf = b""
+            deadline = time.monotonic() + 8.0
+            while b"\n" not in buf:
+                s.settimeout(max(0.001, deadline - time.monotonic()))
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise OSError("subscription closed before acknowledgement")
+                buf += chunk
+                if len(buf) > 1 << 20 or time.monotonic() >= deadline:
+                    raise OSError("subscription acknowledgement exceeded its limit")
+            line, buf = buf.split(b"\n", 1)
+            try:
+                reply = json.loads(line)
+            except ValueError as e:
+                raise OSError("invalid subscription acknowledgement") from e
+            if (reply.get("result") or {}).get("type") != "subscription_started":
+                raise OSError("subscribe: " + str(reply.get("error") or reply))
+            s.setblocking(False)
+        except BaseException:
+            s.close()
+            raise
         self.sock = s
-        self.buf = b""
+        self.buf = buf
         self.panes = set(panes)
         self.backoff = 1.0
+        # Replacement streams are live-only in herdr 0.9. Cover their gap
+        # with a fresh snapshot on the next loop, without blocking on churn.
+        self.snapshot_pending = True
 
     def close(self):
         if self.sock:
@@ -87,18 +112,21 @@ class Subscription:
             except OSError:
                 pass
         self.sock = None
+        self.buf = b""
+        self.snapshot_pending = False
 
     def read(self):
         """Drain readable data; yield decoded event lines. Returns False on EOF."""
-        try:
-            chunk = self.sock.recv(1 << 20)
-        except (BlockingIOError, InterruptedError):
-            return True
-        except OSError:
-            return False
-        if not chunk:
-            return False
-        self.buf += chunk
+        if b"\n" not in self.buf:
+            try:
+                chunk = self.sock.recv(1 << 20)
+            except (BlockingIOError, InterruptedError):
+                return True
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            self.buf += chunk
         while b"\n" in self.buf:
             line, self.buf = self.buf.split(b"\n", 1)
             try:
@@ -115,8 +143,15 @@ class Subscription:
 
 def snapshot(sub):
     try:
+        # Subscribe before the baseline: new lifecycle streams do not replay
+        # history. Wait for the acknowledgement before requesting state.
+        if sub.sock is None:
+            sub.open(set())
+        sub.snapshot_pending = False
         resp = request("session.snapshot", {})
     except OSError as e:
+        sub.close()
+        sub.retry_at = time.time() + sub.backoff
         emit({"kind": "snapshot", "ok": False, "error": str(e)})
         return None
     if "error" in resp:
@@ -126,7 +161,7 @@ def snapshot(sub):
     emit({"kind": "snapshot", "ok": True, "snapshot": snap})
     panes = {p.get("pane_id") for p in snap.get("panes", []) if p.get("pane_id")}
     # Status subscriptions are per pane: re-subscribe when the pane set moves.
-    if sub.sock is None or panes != sub.panes:
+    if panes != sub.panes:
         try:
             sub.open(panes)
             emit({"kind": "status", "connected": True, "message": "subscribed to %d panes" % len(panes)})
@@ -143,15 +178,18 @@ def main():
     stdin = sys.stdin.buffer
     inbuf = b""
     while True:
+        if sub.snapshot_pending:
+            snapshot(sub)
         fds = [stdin]
         if sub.sock:
             fds.append(sub.sock)
-        timeout = 2.0 if sub.sock else max(0.2, sub.retry_at - time.time())
+        buffered = sub.sock is not None and b"\n" in sub.buf
+        timeout = 0.0 if buffered or sub.snapshot_pending else (2.0 if sub.sock else max(0.2, sub.retry_at - time.time()))
         try:
             ready, _, _ = select.select(fds, [], [], timeout)
         except InterruptedError:
             continue
-        if sub.sock and sub.sock in ready:
+        if sub.sock and (buffered or sub.sock in ready):
             if not sub.read():
                 sub.close()
                 sub.backoff = min(30.0, sub.backoff * 2)
