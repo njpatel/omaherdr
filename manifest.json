@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "Neil Patel",
   "license": "Apache-2.0",
-  "description": "TUI-style panel for herdr: every session you are attached to from this desktop, its spaces, tabs and agents with live status, and one keypress to jump to any of them.",
+  "description": "TUI-style panel for herdr: live agents and spaces, persistent attention across attached machines and opt-in saved machines, and one keypress to jump to an available target.",
   "preview": "preview.png",
   "kinds": [
     "bar-widget"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Omaherdr",
-    "description": "Agents waiting for input or done in the bar; a panel listing spaces, tabs and agents across every attached herdr (local or --remote) that jumps to the right terminal window and target.",
+    "description": "Agents waiting for input or done in the bar; a panel for live agents, spaces and persistent attention across attached machines and opt-in saved machines, with safe jumps to available targets.",
     "category": "AI",
     "aliases": [
       "omaherdr",
@@ -30,7 +30,14 @@
       "view": "agents",
       "barStyle": "lights",
       "scanIntervalSec": 10,
-      "preferTerminal": "auto"
+      "preferTerminal": "auto",
+      "notifications": false,
+      "notifyDone": true,
+      "completionDelaySec": 3,
+      "snoozeMinutes": 10,
+      "quietStart": "",
+      "quietEnd": "",
+      "watchSavedMachines": false
     },
     "schema": [
       {
@@ -70,10 +77,66 @@
         "label": "Panel view",
         "options": [
           "agents",
-          "spaces"
+          "spaces",
+          "attention"
         ],
         "defaultValue": "agents",
-        "description": "agents = one row per agent, most urgent first; spaces = every space with its tabs."
+        "description": "agents = one row per agent, most urgent first; spaces = every space with its tabs; attention = pending input, completions and unavailable saved connections until they resolve."
+      },
+      {
+        "key": "notifications",
+        "type": "boolean",
+        "label": "Desktop alerts",
+        "defaultValue": false,
+        "description": "Opt in to generic desktop alerts when an agent needs input or finishes. Alerts never include prompt or transcript text."
+      },
+      {
+        "key": "notifyDone",
+        "type": "boolean",
+        "label": "Alert when agents finish",
+        "defaultValue": true,
+        "description": "Include completed agents when desktop alerts are enabled."
+      },
+      {
+        "key": "completionDelaySec",
+        "type": "integer",
+        "label": "Seconds to group completions",
+        "min": 1,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "Wait briefly so agents finishing together in one workspace can share one alert."
+      },
+      {
+        "key": "snoozeMinutes",
+        "type": "integer",
+        "label": "Snooze duration in minutes",
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "How long the selected attention item stays snoozed without changing its Herdr state."
+      },
+      {
+        "key": "quietStart",
+        "type": "string",
+        "label": "Quiet hours start",
+        "defaultValue": "",
+        "description": "Optional 24-hour HH:MM time. Leave either quiet-hours field empty, or set both equal, to disable quiet hours."
+      },
+      {
+        "key": "quietEnd",
+        "type": "string",
+        "label": "Quiet hours end",
+        "defaultValue": "",
+        "description": "Optional 24-hour HH:MM time. Overnight ranges are supported."
+      },
+      {
+        "key": "watchSavedMachines",
+        "type": "boolean",
+        "label": "Watch saved machines",
+        "defaultValue": false,
+        "description": "Opt in to background monitoring of enabled saved machine profiles, including ones not currently attached to this desktop."
       },
       {
         "key": "scanIntervalSec",

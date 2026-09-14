@@ -8,8 +8,8 @@ import qs.Ui
 // Omaherdr: a bar icon and a TUI-style panel for every herdr you are attached
 // to from this desktop. bin/omaherdr-daemon finds the sessions, follows their
 // servers live and streams one JSON state per change; this file renders it and
-// sends jump commands back. Keys: j/k move · Enter jump · v spaces/agents ·
-// h redact · r cycle the bar text · l lights/inverse · i cycle the bar icon · R refresh · Esc close.
+// sends jump and attention commands back. Keys: j/k move · Enter open · v views ·
+// n alerts · s/S snooze/restore · m mute · h redact · R refresh · Esc close.
 
 Panel {
   id: root
@@ -45,12 +45,22 @@ Panel {
     Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "barStyle", barStyle])
   }
 
-  property string viewMode: String(setting("view", "agents"))   // agents | spaces
+  property string viewMode: String(setting("view", "agents"))   // agents | spaces | attention
+  readonly property var viewModes: ["agents", "spaces", "attention"]
   function toggleView() {
-    viewMode = viewMode === "agents" ? "spaces" : "agents"
+    var index = viewModes.indexOf(viewMode)
+    viewMode = viewModes[(index < 0 ? 0 : index + 1) % viewModes.length]
     Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "view", viewMode])
     cursor = 0
   }
+
+  property bool notifications: booleanSetting("notifications", false)
+  property bool notifyDone: booleanSetting("notifyDone", true)
+  property int completionDelaySec: Math.max(1, Math.min(30, Number(setting("completionDelaySec", 3))))
+  property int snoozeMinutes: Math.max(1, Math.min(120, Number(setting("snoozeMinutes", 10))))
+  property string quietStart: String(setting("quietStart", ""))
+  property string quietEnd: String(setting("quietEnd", ""))
+  property bool watchSavedMachines: booleanSetting("watchSavedMachines", false)
 
   readonly property string daemonPath: Qt.resolvedUrl("bin/omaherdr-daemon").toString().replace(/^file:\/\//, "")
   // How often the daemon looks for herdr clients coming and going (agent status is pushed, not polled).
@@ -61,6 +71,35 @@ Panel {
   function setting(name, fallback) {
     var s = root.settings || ({})
     return s[name] !== undefined && s[name] !== null ? s[name] : fallback
+  }
+  function booleanSetting(name, fallback) {
+    var value = setting(name, fallback)
+    return value === true || String(value) === "true"
+  }
+  function attentionSettings() {
+    return {
+      _activeWidget: root.bar !== null,
+      notifications: notifications,
+      notifyDone: notifyDone,
+      completionDelaySec: completionDelaySec,
+      snoozeMinutes: snoozeMinutes,
+      quietStart: quietStart,
+      quietEnd: quietEnd,
+      watchSavedMachines: watchSavedMachines
+    }
+  }
+  function queueAttentionSettings() { settingsTimer.restart(); rebuild() }
+  onNotificationsChanged: queueAttentionSettings()
+  onNotifyDoneChanged: queueAttentionSettings()
+  onCompletionDelaySecChanged: queueAttentionSettings()
+  onSnoozeMinutesChanged: queueAttentionSettings()
+  onQuietStartChanged: queueAttentionSettings()
+  onQuietEndChanged: queueAttentionSettings()
+  onWatchSavedMachinesChanged: queueAttentionSettings()
+  onBarChanged: queueAttentionSettings()
+  function toggleNotifications() {
+    notifications = !notifications
+    Quickshell.execDetached(["omarchy", "bar", "set", "njpatel.omaherdr", "notifications", String(notifications)])
   }
 
   // ---------------------------------------------------------------- theme
@@ -102,9 +141,12 @@ Panel {
   property int cursor: 0
   property string filter: ""       // substring, case-insensitive
   property bool filtering: false   // typing into the filter (/)
+  function cleanText(text) {
+    return String(text === null || text === undefined ? "" : text).slice(0, 1024).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+  }
   function matches(text) {
     if (!filter) return true
-    return String(text || "").toLowerCase().indexOf(filter.toLowerCase()) >= 0
+    return cleanText(text).toLowerCase().indexOf(filter.toLowerCase()) >= 0
   }
   function startFilter() {
     filtering = true
@@ -119,8 +161,9 @@ Panel {
   property double nowMs: Date.now()
   readonly property var counts: snap && snap.counts ? snap.counts : ({})
   readonly property var servers: snap && snap.servers ? snap.servers : []
+  readonly property var attentionState: snap && snap.attention ? snap.attention : null
   readonly property bool alarming: (counts.blocked || 0) > 0
-  readonly property bool attention: alarming || (counts.done || 0) > 0
+  readonly property bool hasAttention: alarming || (counts.done || 0) > 0
 
   // Priority order and glyphs per agent status.
   readonly property var statusOrder: ({ "blocked": 0, "done": 1, "working": 2, "unknown": 3, "idle": 4 })
@@ -140,6 +183,7 @@ Panel {
     command: [root.daemonPath, "--scan", String(root.scanIntervalSec), "--prefer", root.preferTerminal]
     running: true
     stdinEnabled: true
+    onStarted: root.sendSettingsNow()
     stdout: SplitParser {
       onRead: function(data) { root.parseState(data) }
     }
@@ -156,11 +200,23 @@ Panel {
     interval: 5000
     onTriggered: daemon.running = true
   }
+  Timer {
+    id: settingsTimer
+    interval: 0
+    onTriggered: root.sendSettingsNow()
+  }
 
   function parseState(text) {
     try {
       var parsed = JSON.parse(String(text || ""))
-      if (parsed && typeof parsed === "object") { root.snap = parsed; root.nowMs = Date.now() }
+      if (!parsed || typeof parsed !== "object") return
+      if (parsed.kind === "ui") {
+        if (parsed.action === "show_attention") root.showAttention(parsed.filter)
+        else if (parsed.action === "close_attention") root.close()
+        return
+      }
+      root.snap = parsed
+      root.nowMs = Date.now()
     } catch (e) {
       console.warn("omaherdr", "bad state line", e)
     }
@@ -171,12 +227,51 @@ Panel {
     daemon.write(cmd + "\n")
   }
   function refresh() { send("refresh") }
+  function sendSettingsNow() {
+    if (daemon.running) daemon.write("settings " + JSON.stringify(attentionSettings()) + "\n")
+  }
+  function showAttention(workspaceFilter) {
+    viewMode = "attention"
+    filter = workspaceFilter === undefined || workspaceFilter === null ? "" : cleanText(workspaceFilter).slice(0, 128)
+    cursor = 0
+    root.open()
+  }
+  function selectedTarget() {
+    return jumps.length > 0 ? jumps[Math.min(cursor, jumps.length - 1)].target : null
+  }
+  function sendAttention(action, target) {
+    if (!target || !target.attentionId) return false
+    send("attention " + JSON.stringify({ action: action, target: String(target.attentionId) }))
+    return true
+  }
+  function snoozeSelected() {
+    var target = selectedTarget()
+    return target && target.targetType === "attention" ? sendAttention("snooze", target) : false
+  }
+  function unsnoozeSelected() {
+    var target = selectedTarget()
+    return target && target.targetType === "attention" ? sendAttention("unsnooze", target) : false
+  }
+  function muteSelected() {
+    var target = selectedTarget()
+    if (!target || (target.targetType !== "attention" && target.targetType !== "muted_workspace")) return false
+    return sendAttention(target.muted ? "unmute" : "mute", target)
+  }
 
   // Jump: focus the terminal window, then the space / tab / pane inside herdr.
   function go(target) {
     if (!target) return
     send("go " + target.server + " " + target.kind + " " + target.id)
     root.close()
+  }
+  function activateTarget(target) {
+    if (!target) return
+    if (target.targetType === "attention") {
+      if (sendAttention("open", target) && target.canOpen) root.close()
+      return
+    }
+    if (target.targetType === "muted_workspace") return
+    go(target)
   }
 
   Timer {
@@ -206,9 +301,19 @@ Panel {
     function refresh(): string { root.refresh(); return "ok" }
     function scrub(): string { root.scrub = !root.scrub; return root.scrub ? "scrubbed" : "clear" }
     function view(): string { root.toggleView(); return root.viewMode }
-    function filter(text: string): string { root.filter = text; return root.filter }
+    function filter(text: string): string { root.filter = root.cleanText(text).slice(0, 128); return root.filter }
     function metric(name: string): string { root.barMetric = name; return root.barMetric }
     function style(name: string): string { root.barStyle = name; return root.barStyle }
+    function attention(): string { root.showAttention(""); return "attention" }
+    function notice(action: string, token: string): string {
+      if ((action !== "open" && action !== "show") || !/^[ec]:[0-9a-f]{24}$/.test(token)) return "invalid notice"
+      root.showAttention("")
+      root.send("attention " + JSON.stringify({ action: action, target: token }))
+      return "ok"
+    }
+    function snooze(): string { return root.snoozeSelected() ? "ok" : "no attention selection" }
+    function unsnooze(): string { return root.unsnoozeSelected() ? "ok" : "no attention selection" }
+    function mute(): string { return root.muteSelected() ? "ok" : "no workspace selection" }
     // Widget rectangle on the bar in logical monitor coordinates (screenshots).
     function barGeometry(): string {
       var p = row.mapToItem(null, 0, 0)
@@ -247,7 +352,7 @@ Panel {
     }
     return out
   }
-  function label(text) { text = String(text || ""); return scrub ? noise(text) : text }
+  function label(text) { text = cleanText(text).slice(0, 128); return scrub ? noise(text) : text }
 
   // ---------------------------------------------------------------- layout
   readonly property int cols: 62
@@ -287,7 +392,7 @@ Panel {
     return frag(html, len)
   }
   function cell(text, w, color, right, bg) {
-    text = String(text === null || text === undefined ? "" : text)
+    text = cleanText(text)
     if (text.length > w) text = w > 1 ? text.slice(0, w - 1) + "…" : text.slice(0, w)
     return frag(span(right ? lpad(text, w) : pad(text, w), color, bg), w)
   }
@@ -308,6 +413,7 @@ Panel {
   function blank() { return line(frag("", 0)) }
   function rule(title, first, last) {
     var l = first ? "┌" : (last ? "└" : "├"), r = first ? "┐" : (last ? "┘" : "┤")
+    title = cleanText(title)
     if (!title) return put(span(l + rep("─", cols - 2) + r, faint) + "<br>")
     if (title.length > cols - 6) title = title.slice(0, cols - 7) + "…"
     return put(span(l + "─ ", faint) + span(title, dim) + span(" " + rep("─", cols - 5 - title.length) + r, faint) + "<br>")
@@ -321,49 +427,176 @@ Panel {
     var out = ""
     var c = counts
     var st = root.snap
-    out += rule("HERDR" + (st ? " · " + (c.servers || 0) + (c.servers === 1 ? " server" : " servers") + " · " + (c.agents || 0) + " agents" : ""), true, false)
+    var heading = "HERDR"
+    if (st) heading += " · " + (c.servers || 0) + (c.servers === 1 ? " server" : " servers") + " · " + (c.agents || 0) + " agents"
+    out += rule(heading, true, false)
 
     if (!st) {
       out += line(cell("starting…", inner, dim))
       out += rule("", false, true)
       return finish(out)
     }
-    if (servers.length === 0) {
-      out += line(cell("no herdr session is attached from this desktop", inner, dim))
-      out += line(cell("run herdr (or herdr --remote host) in a terminal", inner, faint))
-      out += rule("", false, true)
-      return finish(out)
-    }
-
-    // Summary: one cell per status, blocked first.
-    out += line(cat(cell("■", 1, red), gap(1), cell((c.blocked || 0) + " need input", 13, (c.blocked || 0) > 0 ? fg : dim), gap(1),
-                    cell("■", 1, yellow), gap(1), cell((c.working || 0) + " working", 11, (c.working || 0) > 0 ? fg : dim), gap(1),
-                    cell("■", 1, green), gap(1), cell((c.done || 0) + " done", 9, (c.done || 0) > 0 ? fg : dim), gap(1),
-                    cell("■", 1, grey), gap(1), cell((c.idle || 0) + " idle", 9, dim)))
 
     var jumpIdx = 0
-    for (var s = 0; s < servers.length; s++) {
-      var srv = servers[s], snap = srv.snapshot
-      var where = srv.windows && srv.windows.length > 0 ? " · window on ws " + srv.windows[0].workspace : " · no window"
-      var title = "@ " + srv.label + (srv.session !== "default" ? " · " + srv.session : "")
-      if (snap) title += " · " + snap.workspaces.length + " spaces · " + snap.panes.length + " panes"
-      out += rule(title + where, false, false)
-      if (!srv.ok || !snap) {
-        out += line(cell("✗ " + (srv.error || "unavailable"), inner, urgent))
-        continue
+    if (viewMode === "attention") {
+      var attentionPart = attentionView(jumpIdx)
+      out += attentionPart.html
+      jumpIdx = attentionPart.jumpIdx
+    } else if (servers.length === 0) {
+      out += line(cell("no herdr session is attached from this desktop", inner, dim))
+      out += line(cell("run herdr (or herdr --remote host) in a terminal", inner, faint))
+    } else {
+      // Summary: one cell per status, blocked first.
+      out += line(cat(cell("■", 1, red), gap(1), cell((c.blocked || 0) + " need input", 13, (c.blocked || 0) > 0 ? fg : dim), gap(1),
+                      cell("■", 1, yellow), gap(1), cell((c.working || 0) + " working", 11, (c.working || 0) > 0 ? fg : dim), gap(1),
+                      cell("■", 1, green), gap(1), cell((c.done || 0) + " done", 9, (c.done || 0) > 0 ? fg : dim), gap(1),
+                      cell("■", 1, grey), gap(1), cell((c.idle || 0) + " idle", 9, dim)))
+
+      for (var s = 0; s < servers.length; s++) {
+        var srv = servers[s], serverSnap = srv.snapshot
+        var where = srv.windows && srv.windows.length > 0 ? " · window on ws " + srv.windows[0].workspace : " · no window"
+        var title = "@ " + label(srv.label) + (srv.session !== "default" ? " · " + label(srv.session) : "")
+        if (serverSnap) title += " · " + serverSnap.workspaces.length + " spaces · " + serverSnap.panes.length + " panes"
+        out += rule(title + where, false, false)
+        if (!srv.ok || !serverSnap) {
+          out += line(cell("✗ " + (srv.error || "unavailable"), inner, urgent))
+          continue
+        }
+        if (!srv.connected) out += line(cell("events disconnected · polling", inner, faint))
+        var part = viewMode === "agents" ? agentsView(srv, jumpIdx) : spacesView(srv, jumpIdx)
+        out += part.html
+        jumpIdx = part.jumpIdx
       }
-      if (!srv.connected) out += line(cell("events disconnected · polling", inner, faint))
-      var part = viewMode === "agents" ? agentsView(srv, jumpIdx) : spacesView(srv, jumpIdx)
-      out += part.html
-      jumpIdx = part.jumpIdx
     }
 
     out += rule("", false, false)
-    out += line(cell("j/k move · ⏎ jump · / filter · h hide · R refresh", inner, dim))
-    out += line(cell("v " + viewMode + " · r " + barMetric + " · l " + barStyle + " · i " + barIconName + (scrub ? " · hidden" : ""), inner, fg))
+    out += line(cell("j/k move · ⏎ open · / filter · h hide · R refresh", inner, dim))
+    out += line(cell("v " + viewMode + " · n alerts " + (notifications ? "on" : "off") + " · s/S snooze/restore · m mute", inner, fg))
+    out += line(cell("r " + barMetric + " · l " + barStyle + " · i " + barIconName + (scrub ? " · hidden" : ""), inner, dim))
     if (filtering || filter) out += line(cat(cell("/ " + filter, inner - 2, accent), cell(filtering ? "▏" : "", 2, accent)))
     out += rule("", false, true)
     return finish(out)
+  }
+
+  function fmtRemaining(ts) {
+    var seconds = Math.max(0, Number(ts || 0) - nowMs / 1000)
+    if (seconds < 60) return "<1m"
+    var minutes = Math.ceil(seconds / 60)
+    if (minutes < 60) return minutes + "m"
+    return Math.ceil(minutes / 60) + "h"
+  }
+
+  function attentionEntryState(entry) {
+    var status = String(entry.status || "unknown")
+    var base = status === "blocked" ? "input" : status === "done" ? "done" : status
+    var snoozed = Number(entry.snoozed_until || 0) > nowMs / 1000
+    if (status === "offline" || entry.connected === false) return "stale/offline"
+    if (entry.muted && snoozed) return "muted+snooze"
+    if (entry.muted) return base + "/muted"
+    if (snoozed) return "snoozed " + fmtRemaining(entry.snoozed_until)
+    if (entry.can_open !== true) return base + "/no jump"
+    return statusText(status) || base
+  }
+
+  function attentionEntryGlyph(entry) {
+    if (entry.status === "offline" || entry.connected === false) return "×"
+    if (entry.muted) return "m"
+    if (Number(entry.snoozed_until || 0) > nowMs / 1000) return "z"
+    return statusGlyph(entry.status)
+  }
+
+  function attentionEntryColor(entry) {
+    if (entry.status === "offline" || entry.connected === false) return dim
+    if (entry.muted) return grey
+    if (Number(entry.snoozed_until || 0) > nowMs / 1000) return yellow
+    return statusColor(entry.status)
+  }
+
+  function attentionGroupKey(entry) {
+    return cleanText(entry.server) + "\u001f" + cleanText(entry.workspace_id || entry.project_id)
+  }
+
+  function attentionGroupTitle(entry) {
+    var location = label(entry.host || entry.server || "saved machine")
+    if (entry.session && entry.session !== "default") location += " · " + label(entry.session)
+    if (entry.workspace) location += " · " + label(entry.workspace)
+    return "@ " + location
+  }
+
+  function attentionMatches(entry) {
+    return matches([entry.host, entry.server, entry.session, entry.workspace, entry.tab, entry.agent,
+                    entry.status, attentionEntryState(entry)].join(" "))
+  }
+
+  function attentionView(jumpIdx) {
+    var out = "", attention = attentionState
+    if (!attention) {
+      out += line(cell("desktop alerts " + (notifications ? "on" : "off") + " · backend unavailable", inner, urgent))
+      out += line(cell("pending attention will appear when the backend connects", inner, dim))
+      return { html: out, jumpIdx: jumpIdx }
+    }
+
+    var stateText = "desktop alerts " + (attention.enabled ? "on" : "off")
+    if (attention.quiet) stateText += " · quiet hours active"
+    else if (quietStart && quietEnd && quietStart !== quietEnd) stateText += " · quiet " + quietStart + "–" + quietEnd
+    if (attention.available === false) stateText += " · backend unavailable"
+    out += line(cell(stateText, inner, attention.available === false ? urgent : (attention.quiet ? yellow : fg)))
+    if (attention.error) out += line(cell("✗ " + attention.error, inner, urgent))
+
+    var ac = attention.counts || ({})
+    out += line(cat(cell("■", 1, red), gap(1), cell((ac.blocked || 0) + " input", 13, (ac.blocked || 0) ? fg : dim), gap(1),
+                    cell("■", 1, green), gap(1), cell((ac.done || 0) + " done", 12, (ac.done || 0) ? fg : dim), gap(1),
+                    cell("×", 1, dim), gap(1), cell((ac.offline || 0) + " offline", 14, dim)))
+
+    var entries = attention.entries ? attention.entries.slice() : []
+    entries = entries.filter(function(entry) { return attentionMatches(entry) })
+    entries.sort(function(a, b) {
+      var ga = attentionGroupKey(a), gb = attentionGroupKey(b)
+      if (ga !== gb) return ga < gb ? -1 : 1
+      var pa = statusOrder[a.status] !== undefined ? statusOrder[a.status] : (a.status === "offline" ? 5 : 4)
+      var pb = statusOrder[b.status] !== undefined ? statusOrder[b.status] : (b.status === "offline" ? 5 : 4)
+      if (pa !== pb) return pa - pb
+      return Number(a.observed_since || 0) - Number(b.observed_since || 0)
+    })
+
+    var group = null
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i], nextGroup = attentionGroupKey(entry)
+      if (nextGroup !== group) {
+        group = nextGroup
+        out += rule(attentionGroupTitle(entry), false, false)
+        out += line(cat(gap(2), cell("agent", 18, faint), gap(1), cell("tab", 10, faint), gap(1), cell("state", 16, faint), gap(1), cell("noticed", 8, faint, true)))
+      }
+      var hl = isCursor(jumpIdx++)
+      var bg = hl ? hilite : null
+      var agentName = entry.kind === "connection" ? "connection" : (entry.agent || "agent")
+      var tabName = entry.kind === "connection" ? (entry.session || entry.host || "endpoint") : (entry.tab || "")
+      var target = { targetType: "attention", attentionId: String(entry.id || ""), muted: Boolean(entry.muted),
+                     canOpen: entry.can_open === true && entry.connected !== false }
+      out += line(cat(cell(attentionEntryGlyph(entry), 1, attentionEntryColor(entry), false, bg), gap(1, bg),
+                      cell(label(agentName), 18, entry.connected === false ? dim : fg, false, bg), gap(1, bg),
+                      cell(label(tabName), 10, entry.connected === false ? dim : fg, false, bg), gap(1, bg),
+                      cell(attentionEntryState(entry), 16, attentionEntryColor(entry), false, bg), gap(1, bg),
+                      cell(fmtSince(entry.observed_since), 8, dim, true, bg)), target, hl)
+    }
+
+    var muted = attention.muted_workspaces ? attention.muted_workspaces.slice() : []
+    muted = muted.filter(function(item) { return matches([item.label, item.server, "muted"].join(" ")) })
+    if (muted.length > 0) {
+      out += rule("MUTED WORKSPACES", false, false)
+      for (var m = 0; m < muted.length; m++) {
+        var item = muted[m], mhl = isCursor(jumpIdx++), mbg = mhl ? hilite : null
+        var mutedTarget = { targetType: "muted_workspace", attentionId: String(item.id || ""), muted: true, canOpen: false }
+        out += line(cat(cell("m", 1, grey, false, mbg), gap(1, mbg), cell(label(item.label || "workspace"), 28, fg, false, mbg), gap(1, mbg),
+                        cell(label(item.server || ""), 17, dim, false, mbg), gap(1, mbg), cell("muted", 8, grey, false, mbg)), mutedTarget, mhl)
+      }
+    }
+
+    if (entries.length === 0 && muted.length === 0) {
+      var hadRows = (attention.entries && attention.entries.length > 0) || (attention.muted_workspaces && attention.muted_workspaces.length > 0)
+      out += line(cell(hadRows && filter ? "nothing matches “" + filter + "”" : "nothing needs attention", inner, dim))
+    }
+    return { html: out, jumpIdx: jumpIdx }
   }
 
   function finish(out) {
@@ -506,7 +739,7 @@ Panel {
   }
   function activateCursor() {
     if (jumps.length === 0) return
-    go(jumps[Math.min(cursor, jumps.length - 1)].target)
+    activateTarget(jumps[Math.min(cursor, jumps.length - 1)].target)
   }
 
   // ---------------------------------------------------------------- bar
@@ -698,6 +931,10 @@ Panel {
         else if (t === "r") root.cycleBarMetric()
         else if (t === "R") root.refresh()
         else if (t === "v" || t === "V") root.toggleView()
+        else if (t === "n" || t === "N") root.toggleNotifications()
+        else if (t === "s") root.snoozeSelected()
+        else if (t === "S") root.unsnoozeSelected()
+        else if (t === "m" || t === "M") root.muteSelected()
         else if (t === "i" || t === "I") root.cycleBarIcon()
         else if (t === "g") { root.cursor = 0; panelFlick.contentY = 0 }
         else if (t === "G") { root.moveCursor(root.jumps.length) }
@@ -714,7 +951,7 @@ Panel {
           if (event.key === Qt.Key_Backspace) { root.filter = root.filter.slice(0, -1); event.accepted = true; return }
           if (event.key === Qt.Key_Down) { root.moveCursor(1); event.accepted = true; return }
           if (event.key === Qt.Key_Up) { root.moveCursor(-1); event.accepted = true; return }
-          if (event.text && event.text.length === 1 && event.text >= " ") { root.filter += event.text; event.accepted = true }
+          if (event.text && event.text.length === 1 && event.text >= " " && root.filter.length < 128) { root.filter += event.text; event.accepted = true }
         }
       }
 
@@ -752,7 +989,7 @@ Panel {
           }
           onClicked: function(mouse) {
             var j = root.jumpAtY(mouse.y)
-            if (j >= 0) root.go(root.jumps[j].target)
+            if (j >= 0) root.activateTarget(root.jumps[j].target)
           }
         }
       }

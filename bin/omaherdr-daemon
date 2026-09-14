@@ -17,11 +17,15 @@
 # right terminal. A local server that is running with nobody attached is
 # listed too (no window to jump to). Remote servers are reached over ssh with
 # the same target string the user typed; omaherdr-helper is shipped inline.
+import atexit
 import base64
 import json
 import os
 import queue
 import re
+import selectors
+import signal
+from collections import deque
 import shlex
 import subprocess
 import sys
@@ -30,6 +34,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "omaherdr-helper")
+NOTIFIER = os.path.join(HERE, "omaherdr-notify")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy", "omaherdr")
 SINCE_FILE = os.path.join(STATE_DIR, "since.json")
 DEFAULT_SOCK = "~/.config/herdr/herdr.sock"
@@ -37,6 +42,8 @@ SCAN_EVERY = 10.0         # process scan; overridable with --scan N
 PREFER_TERMINAL = ""      # window-class substring that wins the ranking; --prefer CLASS
 SNAPSHOT_EVERY = 60.0
 DEBOUNCE = 0.25
+NOTIFICATION_DEFAULTS = {"notifications": False, "notifyDone": True, "completionDelaySec": 3,
+                         "snoozeMinutes": 10, "quietStart": "", "quietEnd": "", "watchSavedMachines": False, "_activeWidget": False}
 
 events = queue.Queue()
 
@@ -51,6 +58,47 @@ def run(cmd, timeout=10):
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def run_bounded(cmd, timeout=5, limit=131072, cancelled=None):
+    """Bound discovery output while reading and reap our own process group."""
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                if cancelled is not None and cancelled.is_set():
+                    return None
+                if not selector.select(min(0.1, max(0, deadline - time.monotonic()))):
+                    continue
+                chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
+                if not chunk:
+                    while process.poll() is None and time.monotonic() < deadline:
+                        if cancelled is not None and cancelled.is_set():
+                            return None
+                        time.sleep(0.02)
+                    return data.decode("utf-8", errors="replace") if process.poll() == 0 else None
+                data.extend(chunk)
+                if len(data) > limit:
+                    return None
+        return None
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(0.5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            except ProcessLookupError:
+                process.wait()
+        process.stdout.close()
 
 
 # ------------------------------------------------------------------ discovery
@@ -170,6 +218,69 @@ def parse_session_list(text):
 class Discovery:
     def __init__(self):
         self.session_cache = {}  # host → (ts, rows)
+        self.machine_cache = None
+        self.machine_cache_at = 0.0
+        self.watch_saved = False
+        self.saved_cache = {}
+        self.saved_pending = set()
+        self.saved_results = queue.Queue()
+        self.resolvers = []
+        self.stopping = threading.Event()
+
+    def machines(self):
+        if time.time() - self.machine_cache_at < 60:
+            return self.machine_cache
+        self.machine_cache_at = time.time()
+        text = run_bounded(["herdr", "machine", "list", "--json"], cancelled=self.stopping)
+        try:
+            rows = json.loads(text) if text is not None else None
+        except ValueError:
+            rows = None
+        if isinstance(rows, list) and len(rows) <= 64:
+            self.machine_cache = [row for row in rows if isinstance(row, dict) and row.get("enabled") is True
+                                  and isinstance(row.get("target"), str) and 0 < len(row["target"]) <= 255
+                                  and not row["target"].startswith("-") and not any(c.isspace() or ord(c) < 32 for c in row["target"])
+                                  and isinstance(row.get("session", "default"), str)
+                                  and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", row.get("session", "default"))]
+        else:
+            version = run_bounded(["herdr", "--version"], timeout=2, limit=256, cancelled=self.stopping) or ""
+            match = re.search(r"\bherdr (\d+)\.(\d+)", version)
+            old_client = match is not None and tuple(map(int, match.groups())) < (0, 9)
+            self.machine_cache = [] if old_client else None
+        return self.machine_cache
+
+    def _resolve_saved(self, host):
+        text = run_bounded(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host,
+                            "herdr session list"], timeout=10, limit=65536, cancelled=self.stopping)
+        rows = parse_session_list(text) if text is not None else {}
+        self.saved_results.put((host, rows, "" if text is not None else "Saved session lookup unavailable"))
+        events.put(("_discovery", None))
+
+    def saved_sessions(self, host):
+        while True:
+            try:
+                result_host, rows, error = self.saved_results.get_nowait()
+            except queue.Empty:
+                break
+            self.saved_pending.discard(result_host)
+            previous = self.saved_cache.get(result_host, (0, {}, ""))[1]
+            self.saved_cache[result_host] = (time.time(), rows or previous, error)
+            if len(self.saved_cache) > 128:
+                oldest = min(self.saved_cache, key=lambda key: self.saved_cache[key][0])
+                self.saved_cache.pop(oldest)
+        self.resolvers = [thread for thread in self.resolvers if thread.is_alive()]
+        stamp, rows, error = self.saved_cache.get(host, (0, {}, "Resolving saved session"))
+        if time.time() - stamp >= 60 and host not in self.saved_pending and len(self.saved_pending) < 8:
+            self.saved_pending.add(host)
+            thread = threading.Thread(target=self._resolve_saved, args=(host,), daemon=True)
+            self.resolvers.append(thread)
+            thread.start()
+        return rows, error
+
+    def close(self):
+        self.stopping.set()
+        for thread in self.resolvers:
+            thread.join(timeout=1)
 
     def sessions(self, host, herdr_bin):
         ts, rows = self.session_cache.get(host, (0, {}))
@@ -180,7 +291,7 @@ class Discovery:
         else:
             # Leave a leading ~ unquoted so the remote shell expands it.
             binq = herdr_bin if re.fullmatch(r"[\w./~-]+", herdr_bin) else shlex.quote(herdr_bin)
-            text = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, binq + " session list"], 15)
+            text = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host, binq + " session list"], 15)
         rows = parse_session_list(text)
         self.session_cache[host] = (time.time(), rows)
         return rows
@@ -190,6 +301,8 @@ class Discovery:
         clients = hypr_clients()
         procs = proc_table()
         found = {}
+        machines = self.machines()
+        possible_combined = machines is None or bool(machines)
 
         def windows_for(pid):
             seen = 0
@@ -229,6 +342,7 @@ class Discovery:
                     continue
                 win["terminal"] = terminal_hint(pid, win.get("class"))
                 win["shared_pid"] = len(clients.get(win["pid"], [])) > 1
+                win["federated"] = host == "local" and possible_combined
                 entry["windows"].append(win)
 
         # One window can host clients for several servers (kitty tabs, a
@@ -249,6 +363,21 @@ class Discovery:
             if row.get("status") == "running" and key not in found:
                 found[key] = {"host": "local", "session": name, "socket": row.get("socket") or DEFAULT_SOCK,
                               "herdr_bin": "herdr", "windows": []}
+        if self.watch_saved:
+            for machine in machines or []:
+                host, session = machine["target"], machine.get("session", "default")
+                key = host + ":" + session
+                if key not in found:
+                    rows, error = self.saved_sessions(host)
+                    row = rows.get(session) or {}
+                    sock = row.get("socket")
+                    if (not isinstance(sock, str) or len(sock) > 1024 or not sock.startswith(("/", "~/"))
+                            or any(ord(char) < 32 for char in sock)):
+                        sock = None
+                    found[key] = {"host": host, "session": session, "socket": sock, "herdr_bin": "herdr", "windows": [],
+                                  "resolve_error": error or "Saved session unavailable"}
+                found[key]["saved"] = True
+                found[key]["label"] = machine.get("label") if isinstance(machine.get("label"), str) else host
         return found
 
 
@@ -271,11 +400,16 @@ class Helper:
             code = base64.b64encode(f.read()).decode()
         remote = "python3 -c \"import base64;exec(base64.b64decode('%s'))\" %s" % (code, shlex.quote(self.info["socket"]))
         return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=3", self.info["host"], remote]
+                "-o", "ServerAliveCountMax=3", "--", self.info["host"], remote]
 
     def start(self):
         self.started = time.time()
         self.attempts += 1
+        if self.info and not self.info.get("socket"):
+            self.proc = None
+            events.put((self.key, {"kind": "snapshot", "ok": False,
+                                   "error": self.info.get("resolve_error") or "Resolving server address"}))
+            return
         try:
             self.proc = subprocess.Popen(self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -289,11 +423,14 @@ class Helper:
     def _pump(self, proc):
         for line in proc.stdout:
             try:
-                events.put((self.key, json.loads(line)))
+                message = json.loads(line)
+                if isinstance(message, dict):
+                    message["_process"] = proc
+                    events.put((self.key, message))
             except ValueError:
                 pass
         code = proc.wait()
-        events.put((self.key, {"kind": "exit", "code": code}))
+        events.put((self.key, {"kind": "exit", "code": code, "_process": proc}))
 
     def _pump_err(self, proc):
         for line in proc.stderr:
@@ -320,9 +457,154 @@ class Helper:
                 self.proc.kill()
 
 
+class NotificationBridge(Helper):
+    """Local-only, shared session-bus notification policy; never shipped over SSH."""
+
+    def __init__(self):
+        self.last_state = None
+        self.pending_state = None
+        self.frames = deque()
+        self.offset = 0
+        self.buffered = 0
+        super().__init__("_attention", {})
+
+    def command(self):
+        return [sys.executable, NOTIFIER]
+
+    def start(self):
+        self.last_state = None
+        self.pending_state = None
+        self.frames.clear()
+        self.offset = self.buffered = 0
+        super().start()
+        if self.proc is not None:
+            os.set_blocking(self.proc.stdin.fileno(), False)
+
+    def send(self, payload):
+        return self._queue(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    def _queue(self, serialised):
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        self.flush()
+        frame = (serialised + "\n").encode()
+        if len(frame) > 1048576 or self.buffered + len(frame) > 2097152:
+            return False
+        self.frames.append(frame)
+        self.buffered += len(frame)
+        self.flush()
+        return True
+
+    def flush(self):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        if self.pending_state is not None:
+            frame = (self.pending_state + "\n").encode()
+            if len(frame) > 1048576:
+                self.last_state = self.pending_state
+                self.pending_state = None
+                events.put((self.key, {"kind": "error", "message": "Attention state exceeds the supported size"}))
+            elif self.buffered + len(frame) <= 2097152:
+                self.frames.append(frame)
+                self.buffered += len(frame)
+                self.last_state = self.pending_state
+                self.pending_state = None
+        for _ in range(16):
+            if not self.frames:
+                return
+            try:
+                count = os.write(self.proc.stdin.fileno(), memoryview(self.frames[0])[self.offset:self.offset + 65536])
+            except OSError:
+                return
+            self.offset += count
+            self.buffered -= count
+            if self.offset == len(self.frames[0]):
+                self.frames.popleft()
+                self.offset = 0
+
+    def publish(self, servers, settings):
+        if settings.get("_activeWidget") is not True:
+            return
+        payload = {"op": "state", "state": attention_input(servers), "settings": {key: value for key, value in settings.items() if not key.startswith("_")}}
+        serialised = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if serialised != self.last_state:
+            self.pending_state = serialised
+            self.flush()
+
+    def stop(self):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        self.send({"op": "quit"})
+        deadline = time.monotonic() + 3
+        while self.proc.poll() is None and time.monotonic() < deadline:
+            self.flush()
+            time.sleep(0.02)
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(1)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+
+def identifier(value, limit=128):
+    return value if isinstance(value, str) and 0 < len(value) <= limit and all(ord(c) >= 32 and ord(c) != 127 and not 0xD800 <= ord(c) <= 0xDFFF and not c.isspace() for c in value) else ""
+
+
+def notification_text(value, limit=80):
+    if not isinstance(value, str):
+        return ""
+    return "".join(c for c in value[:limit] if ord(c) >= 32 and ord(c) != 127 and not 0xD800 <= ord(c) <= 0xDFFF and c not in "<>&")
+
+
+def attention_input(servers):
+    """Only bounded identity/status metadata crosses the local notification bus."""
+    result = {"servers": [], "truncated": len(servers) > 64}
+    remaining = 256
+    for key in sorted(servers)[:64]:
+        view = servers[key].view()
+        snapshot = servers[key].notification_snapshot or {}
+        result["truncated"] = result["truncated"] or snapshot.get("truncated", False)
+        agents = []
+        source_agents = snapshot.get("agents", [])
+        if len(source_agents) > remaining:
+            result["truncated"] = True
+        for agent in source_agents[:remaining]:
+            if remaining == 0:
+                result["truncated"] = True
+                break
+            if not all(identifier(agent.get(field)) for field in ("pane_id", "workspace_id", "tab_id")):
+                continue
+            row = {field: identifier(agent.get(field)) for field in ("pane_id", "workspace_id", "tab_id", "terminal_id")}
+            row.update({field: notification_text(agent.get(field)) for field in ("agent", "name")})
+            row["agent_status"] = agent.get("agent_status") if agent.get("agent_status") in ("blocked", "done", "working", "idle", "unknown") else "unknown"
+            sequence = agent.get("state_change_seq")
+            if isinstance(sequence, int) and not isinstance(sequence, bool) and 0 <= sequence < 2 ** 64:
+                row["state_change_seq"] = sequence
+            agents.append(row)
+            remaining -= 1
+        workspace_ids = {agent["workspace_id"] for agent in agents}
+        tab_ids = {agent["tab_id"] for agent in agents}
+        workspaces = [{"workspace_id": row["workspace_id"], "label": notification_text(row.get("label"))}
+                      for row in snapshot.get("workspaces", [])[:512] if isinstance(row, dict) and row.get("workspace_id") in workspace_ids]
+        tabs = [{"tab_id": row["tab_id"], "workspace_id": identifier(row.get("workspace_id")), "label": notification_text(row.get("label"))}
+                for row in snapshot.get("tabs", [])[:512] if isinstance(row, dict) and row.get("tab_id") in tab_ids]
+        result["servers"].append({"key": identifier(key, 512), "host": notification_text(view.get("host")),
+                                  "label": notification_text(view.get("label")), "session": notification_text(view.get("session")),
+                                  "ok": view["ok"], "connected": view["connected"], "can_open": view["can_open"],
+                                  "snapshot": {"agents": agents, "workspaces": workspaces, "tabs": tabs}})
+    return result
+
+
+def show_attention(filter_text=""):
+    sys.stdout.write(json.dumps({"kind": "ui", "action": "show_attention", "filter": notification_text(filter_text)}) + "\n")
+    sys.stdout.flush()
+
+
 # ------------------------------------------------------------------ state
-PANE_FIELDS = ("pane_id", "tab_id", "workspace_id", "label", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd")
-AGENT_FIELDS = ("pane_id", "tab_id", "workspace_id", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd", "name")
+PANE_FIELDS = ("pane_id", "terminal_id", "tab_id", "workspace_id", "label", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd")
+AGENT_FIELDS = ("pane_id", "terminal_id", "state_change_seq", "tab_id", "workspace_id", "agent", "agent_status", "focused", "terminal_title_stripped", "cwd", "name")
 
 
 def slim(obj, fields):
@@ -337,6 +619,7 @@ class Server:
         self.error = None
         self.connected = False
         self.snapshot = None
+        self.notification_snapshot = None
         self.status = {}          # pane_id → last agent_status seen
         self.since = {}           # pane_id → ts the status was first seen
         self.want_snapshot_at = None
@@ -373,6 +656,11 @@ class Server:
             "panes": panes,
             "agents": agents,
         }
+        # Status events lack state_change_seq. Keep an authoritative alert
+        # snapshot separate from the bar's immediate in-place event updates.
+        self.notification_snapshot = {"agents": [dict(agent) for agent in agents[:256]],
+                                      "workspaces": self.snapshot["workspaces"], "tabs": self.snapshot["tabs"],
+                                      "truncated": len(agents) > 256}
 
     def note_status(self, pane_id, status, now):
         if self.status.get(pane_id) != status:
@@ -394,9 +682,11 @@ class Server:
     def view(self):
         return {
             "key": self.key, "host": self.info["host"], "session": self.info["session"],
-            "label": self.info["host"] if self.info["host"] != "local" else os.uname().nodename,
+            "label": self.info.get("label") or (self.info["host"] if self.info["host"] != "local" else os.uname().nodename),
             "ok": self.ok, "error": self.error, "connected": self.connected,
             "windows": self.info.get("windows", []),
+            "can_open": any(window.get("address") and not window.get("federated", False) for window in self.info.get("windows", [])),
+            "saved": bool(self.info.get("saved")),
             "snapshot": self.snapshot,
             "since": self.since,
             "snapshot_ts": self.last_snapshot,
@@ -444,11 +734,12 @@ def stdin_reader():
     events.put(("_stdin", "quit"))
 
 
-def emit(servers, discovered_ts):
+def emit(servers, discovered_ts, attention, notifier, settings):
     views = [servers[k].view() for k in sorted(servers)]
-    out = {"generated_ts": time.time(), "scan_ts": discovered_ts, "counts": counts(list(servers.values())), "servers": views}
+    out = {"generated_ts": time.time(), "scan_ts": discovered_ts, "counts": counts(list(servers.values())), "servers": views, "attention": attention}
     sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+    notifier.publish(servers, settings)
 
 
 def main():
@@ -468,16 +759,39 @@ def main():
             pass
     discovery = Discovery()
     servers, helpers = {}, {}
+    notifier = NotificationBridge()
+    notification_settings = dict(NOTIFICATION_DEFAULTS)
+    attention = {"available": False, "enabled": False, "quiet": False, "error": "Starting attention backend", "entries": [], "muted_workspaces": [], "counts": {}}
+    stopping = False
+
+    def request_shutdown(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    def shutdown():
+        discovery.close()
+        for helper in helpers.values():
+            helper.stop()
+        notifier.stop()
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    atexit.register(shutdown)
     remembered = load_since()
     threading.Thread(target=stdin_reader, daemon=True).start()
 
     last_scan = 0.0
     dirty_at = None
     scan_ts = 0.0
-    emit(servers, scan_ts)  # an empty state straight away, so the widget never sits blank
+    emit(servers, scan_ts, attention, notifier, notification_settings)
 
-    while True:
+    while not stopping:
         now = time.time()
+        notifier.flush()
+        if notifier.proc is None or notifier.proc.poll() is not None:
+            if now - notifier.started >= min(60, 2 ** min(notifier.attempts, 6)):
+                notifier.start()
+                dirty_at = now
         if now - last_scan >= SCAN_EVERY:
             last_scan = now
             found = discovery.scan()
@@ -496,8 +810,16 @@ def main():
                         servers[key].since = dict(mem.get("since", {}))
                     helpers[key] = Helper(key, info)
                     dirty_at = now
-                elif servers[key].info.get("windows") != info.get("windows"):
-                    servers[key].info["windows"] = info.get("windows", [])
+                elif servers[key].info != info:
+                    address_changed = servers[key].info.get("socket") != info.get("socket")
+                    servers[key].info = info
+                    if address_changed:
+                        helpers[key].stop()
+                        servers[key].connected = False
+                        servers[key].ok = False
+                        helpers[key] = Helper(key, info)
+                    else:
+                        helpers[key].info = info
                     dirty_at = now
             # Safety net: periodic full snapshots.
             for key, s in servers.items():
@@ -520,6 +842,10 @@ def main():
             key, msg = events.get(timeout=0.2)
         except queue.Empty:
             key, msg = None, None
+        if isinstance(msg, dict) and "_process" in msg:
+            owner = notifier if key == "_attention" else helpers.get(key)
+            if owner is None or msg["_process"] is not owner.proc:
+                continue
 
         if key == "_stdin":
             cmd = msg.split()
@@ -529,13 +855,50 @@ def main():
                 break
             elif cmd[0] == "refresh":
                 last_scan = 0.0
+                discovery.machine_cache_at = 0
                 for h in helpers.values():
                     h.send("snapshot")
-            elif cmd[0] == "go" and len(cmd) >= 4:
+            elif cmd[0] == "settings" and len(msg) <= 16384:
+                try:
+                    settings = json.loads(msg.partition(" ")[2])
+                    if not isinstance(settings, dict):
+                        raise ValueError("settings must be an object")
+                    was_active = notification_settings["_activeWidget"]
+                    notification_settings.update({name: settings[name] for name in NOTIFICATION_DEFAULTS if name in settings})
+                    notification_settings["_activeWidget"] = settings.get("_activeWidget", True) is True
+                    if was_active and not notification_settings["_activeWidget"]:
+                        notifier.stop()
+                    watch_saved = notification_settings["watchSavedMachines"] is True and notification_settings["_activeWidget"]
+                    if discovery.watch_saved != watch_saved:
+                        discovery.watch_saved = watch_saved
+                        last_scan = 0
+                    dirty_at = now
+                except (ValueError, TypeError):
+                    log("invalid notification settings message")
+            elif cmd[0] == "attention" and len(msg) <= 4096:
+                try:
+                    command = json.loads(msg.partition(" ")[2])
+                    action, target = command.get("action"), command.get("target", "")
+                    if action not in ("open", "show", "snooze", "unsnooze", "mute", "unmute", "clear_mutes") or not isinstance(target, str) or len(target) > 256:
+                        raise ValueError("invalid attention command")
+                    if not notifier.send({"op": "command", "action": action, "target": target}):
+                        attention = dict(attention, available=False, error="Attention backend unavailable or busy")
+                        dirty_at = now
+                except (ValueError, TypeError, AttributeError):
+                    log("invalid attention command")
+            elif cmd[0] in ("go", "go-notification") and len(cmd) >= 4:
                 skey, kind, target = cmd[1], cmd[2], cmd[3]
                 s = servers.get(skey)
                 if s:
                     wins = s.info.get("windows") or []
+                    if cmd[0] == "go-notification":
+                        terminal_id = cmd[4] if len(cmd) == 5 else ""
+                        agents = (s.snapshot or {}).get("agents", [])
+                        valid_target = any(agent.get("pane_id") == target and (agent.get("terminal_id") or "") == terminal_id for agent in agents)
+                        wins = [window for window in wins if not window.get("federated") and re.fullmatch(r"0x[0-9a-fA-F]+", str(window.get("address", "")))]
+                        if kind != "pane" or not s.ok or not s.connected or not valid_target or not wins:
+                            show_attention()
+                            continue
                     if len(wins) > 1:
                         # Several candidate windows (two clients on one server, or a
                         # single-process terminal like Ghostty / foot --server owning
@@ -572,7 +935,25 @@ def main():
                         "pane": ("pane.focus", {"pane_id": target}),
                     }.get(kind, (None, None))
                     if method:
-                        helpers[skey].send("rpc " + json.dumps({"id": "go", "method": method, "params": params}))
+                        helpers[skey].send("rpc " + json.dumps({"id": cmd[0], "method": method, "params": params}))
+        elif key == "_discovery":
+            last_scan = 0
+        elif key == "_attention":
+            if msg.get("kind") == "attention" and isinstance(msg.get("attention"), dict):
+                attention = msg["attention"]
+                dirty_at = now
+            elif msg.get("kind") in ("error", "exit", "status"):
+                attention = dict(attention, available=False, error=notification_text(msg.get("message")) or "Attention backend unavailable")
+                dirty_at = now
+            elif msg.get("kind") == "action":
+                if msg.get("action") == "show_attention":
+                    show_attention(msg.get("filter", ""))
+                elif msg.get("action") == "go":
+                    server_key, pane_id, terminal_id = msg.get("server"), msg.get("id"), msg.get("terminal_id")
+                    if identifier(server_key, 512) and identifier(pane_id) and identifier(terminal_id):
+                        events.put(("_stdin", "go-notification " + server_key + " pane " + pane_id + " " + terminal_id))
+                    else:
+                        show_attention()
         elif key in servers:
             s = servers[key]
             kind = msg.get("kind")
@@ -592,6 +973,11 @@ def main():
             elif kind == "rpc":
                 if msg.get("error"):
                     log(key, "rpc", msg.get("method"), msg["error"])
+                    if msg.get("id") == "go-notification":
+                        show_attention()
+                elif msg.get("id") == "go-notification":
+                    sys.stdout.write(json.dumps({"kind": "ui", "action": "close_attention"}) + "\n")
+                    sys.stdout.flush()
             elif kind == "exit":
                 s.connected = False
                 s.ok = False
@@ -599,11 +985,11 @@ def main():
                 dirty_at = time.time()
 
         if dirty_at is not None and time.time() - dirty_at >= 0.05:
-            emit(servers, scan_ts)
+            emit(servers, scan_ts, attention, notifier, notification_settings)
             dirty_at = None
 
-    for h in helpers.values():
-        h.stop()
+    shutdown()
+    atexit.unregister(shutdown)
 
 
 if __name__ == "__main__":
