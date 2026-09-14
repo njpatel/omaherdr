@@ -231,6 +231,18 @@ class Discovery:
                 win["shared_pid"] = len(clients.get(win["pid"], [])) > 1
                 entry["windows"].append(win)
 
+        # One window can host clients for several servers (kitty tabs, a
+        # single-process terminal). A window that hosts exactly one server is
+        # that server's home, wherever it lives; ranking prefers it so a jump
+        # lands on the same monitor every time, not on the monitor in use.
+        hosted = {}
+        for entry in found.values():
+            for w in entry["windows"]:
+                hosted[w["address"]] = hosted.get(w["address"], 0) + 1
+        for entry in found.values():
+            for w in entry["windows"]:
+                w["servers_on_window"] = hosted.get(w["address"], 1)
+
         # Local servers running with no client attached.
         for name, row in self.sessions("local", "herdr").items():
             key = "local:" + name
@@ -529,7 +541,10 @@ def main():
                         # single-process terminal like Ghostty / foot --server owning
                         # every window). herdr titles its terminal "{hostname}: {workspace}",
                         # so prefer a title naming the server's focused space, then the
-                        # host, then a window on the current workspace, then most recent focus.
+                        # host, then a window that hosts this server alone, then a window
+                        # on the current workspace, then most recent focus. The dedicated
+                        # window wins before the current workspace does: a server parked on
+                        # a second monitor must be reached there, not reopened next to us.
                         snap = s.snapshot or {}
                         label = next((w.get("label", "") for w in snap.get("workspaces", []) if w.get("workspace_id") == snap.get("focused_workspace_id")), "")
                         hostl = s.info["host"] if s.info["host"] != "local" else os.uname().nodename
@@ -539,6 +554,7 @@ def main():
                             cur_ws = None
                         wins = sorted(wins, key=lambda w: (bool(PREFER_TERMINAL) and PREFER_TERMINAL in (w.get("class") or "").lower(),
                                                            bool(label) and label in w.get("title", ""), hostl in w.get("title", ""),
+                                                           int(w.get("servers_on_window", 1)) == 1,
                                                            w.get("workspace") == cur_ws, -int(w.get("focus_rank", 999))), reverse=True)
                     if wins:
                         # Hyprland ≥ 0.56 dispatches Lua; older builds take the classic form.
