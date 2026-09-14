@@ -131,7 +131,7 @@ class AttentionEngineTests(unittest.TestCase):
             clock.advance(1)
             effect = notices(engine.tick())[0]
             entry = engine.view()["entries"][0]
-            self.assertEqual(engine.command("open", effect["key"])["action"], "go")
+            self.assertEqual(engine.command("open", entry["id"])["action"], "go")
 
             engine.notification_closed(effect["key"], 2)
             self.assertEqual(engine.view()["counts"]["blocked"], 1)
@@ -219,7 +219,46 @@ class AttentionEngineTests(unittest.TestCase):
             effects = notices(engine.tick())
             self.assertEqual(len(effects), 1)
             self.assertEqual(set(effects[0]["entry_ids"]), {entry["id"] for entry in engine.view()["entries"]})
-            self.assertIn("show", {action["id"] for action in effects[0]["actions"]})
+            self.assertEqual(effects[0]["status"], "done")
+            self.assertEqual([action["id"] for action in effects[0]["actions"]], ["open"])
+
+    def test_mixed_group_prefers_blocked_and_keeps_meaningful_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            clock.set_local(21, 59)
+            configured = settings(quietStart="22:00", quietEnd="07:00")
+            engine = ATTENTION.AttentionEngine(directory, clock)
+
+            def with_context(state):
+                server = state["servers"][0]
+                server.update({"host": "build-host", "session": "federation"})
+                server["snapshot"]["workspaces"][0]["label"] = "Release train"
+                for tab in server["snapshot"]["tabs"]:
+                    tab["label"] = "42" if tab["tab_id"] == "numeric" else "Verification"
+                return state
+
+            builder = agent("p1", "term1", "working", 1, tab="numeric", name="Builder")
+            reviewer = agent("p2", "term2", "working", 1, tab="named", name="Reviewer")
+            engine.update(with_context(merged(builder, reviewer)), configured)
+
+            clock.set_local(22, 0)
+            builder = agent("p1", "term1", "blocked", 2, tab="numeric", name="Builder")
+            reviewer = agent("p2", "term2", "done", 2, tab="named", name="Reviewer")
+            engine.update(with_context(merged(builder, reviewer)), configured)
+            self.assertEqual(engine.tick(), [])
+
+            clock.set_local(7, 0)
+            effect = notices(engine.tick())[0]
+            self.assertEqual(effect["status"], "blocked")
+            self.assertEqual([action["id"] for action in effect["actions"]], ["open"])
+            self.assertIn("Release train", effect["summary"])
+            self.assertIn("Builder", effect["body"])
+            self.assertIn("Reviewer", effect["body"])
+            self.assertIn("Verification", effect["body"])
+            self.assertIn("build-host", effect["body"])
+            self.assertIn("federation", effect["body"])
+            self.assertNotIn("42", effect["body"])
+            self.assertEqual(engine.command("open", effect["entry_ids"][0])["action"], "go")
 
     def test_snooze_expiry_realerts_once_at_the_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,6 +333,8 @@ class AttentionEngineTests(unittest.TestCase):
             self.assertEqual(engine.tick(), [])
             clock.advance(0.01)
             effect = notices(engine.tick())[0]
+            self.assertEqual(effect["status"], "offline")
+            self.assertEqual([action["id"] for action in effect["actions"]], ["show"])
             engine.notification_result(effect["key"], effect["token"], True)
             engine.update(merged(working, connected=False), settings())
             self.assertEqual(engine.tick(), [])

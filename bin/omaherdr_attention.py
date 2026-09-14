@@ -874,6 +874,89 @@ class AttentionEngine:
     def _is_muted(self, record):
         return record["project_id"] in self._muted
 
+    @staticmethod
+    def _notice_status(records):
+        return "blocked" if any(record["status"] == "blocked" for record in records) else "done"
+
+    @staticmethod
+    def _label_key(value):
+        return _plain(value).casefold()
+
+    @classmethod
+    def _notice_agent(cls, record):
+        agent = record["agent"]
+        key = cls._label_key(agent)
+        if key in ("", "agent", "assistant") or key == cls._label_key(record["workspace"]):
+            return ""
+        return agent
+
+    @classmethod
+    def _notice_tab(cls, record):
+        tab = record["tab"]
+        key = cls._label_key(tab)
+        if (not key or key in ("tab", "pane", "terminal")
+                or re.fullmatch(r"(?:tab|pane|terminal)?\s*[#:_-]?\s*\d+", key)
+                or key in (cls._label_key(record["workspace"]), cls._label_key(record["agent"]))):
+            return ""
+        return tab
+
+    @classmethod
+    def _notice_location(cls, record):
+        parts = []
+        host = record["host"]
+        host_key = cls._label_key(host)
+        if host_key not in ("", "local", "localhost", "127.0.0.1", "::1"):
+            parts.append(host)
+        session = record["session"]
+        session_key = cls._label_key(session)
+        if session_key not in ("", "default") and session_key != host_key:
+            parts.append("session " + session)
+        return " · ".join(parts)
+
+    @classmethod
+    def _notice_details(cls, record):
+        parts = []
+        agent = cls._notice_agent(record)
+        tab = cls._notice_tab(record)
+        if agent:
+            parts.append(agent)
+        if tab and cls._label_key(tab) not in {cls._label_key(item) for item in parts}:
+            parts.append(tab)
+        return " · ".join(parts)
+
+    @classmethod
+    def _notice_summary(cls, records):
+        workspace = records[0]["workspace"]
+        blocked = sum(record["status"] == "blocked" for record in records)
+        if len(records) == 1:
+            lead = "Needs input" if blocked else "Finished"
+        elif blocked == len(records):
+            lead = "%d agents need input" % len(records)
+        elif blocked:
+            lead = "%d need input, %d finished" % (blocked, len(records) - blocked)
+        else:
+            lead = "%d agents finished" % len(records)
+        return lead + " — " + workspace
+
+    @classmethod
+    def _notice_body(cls, records):
+        lines = []
+        for record in records[:4]:
+            state = "Blocked" if record["status"] == "blocked" else "Done"
+            details = cls._notice_details(record)
+            lines.append(state + (" — " + details if details else ""))
+        if len(records) > 4:
+            lines.append("+%d more" % (len(records) - 4))
+        locations = {cls._notice_location(record) for record in records}
+        locations.discard("")
+        if len(locations) == 1:
+            lines.append(locations.pop())
+        return "\n".join(lines)
+
+    @staticmethod
+    def _notice_actions():
+        return [{"id": "open", "label": "Open agent"}]
+
     def _start_notification(self, base, records, summary, body, actions):
         old_key = self._active_by_base.get(base)
         if old_key:
@@ -900,6 +983,7 @@ class AttentionEngine:
             "token": self._token,
             "summary": summary,
             "body": body,
+            "status": self._notice_status(records),
             "actions": actions,
             "entry_ids": list(episodes),
             "urgency": 1,
@@ -932,8 +1016,9 @@ class AttentionEngine:
                     "op": "notify",
                     "key": key,
                     "token": self._token,
-                    "summary": "Connection unavailable — " + endpoint["host"],
-                    "body": "Session " + endpoint["session"] + "; last known attention stays in the list.",
+                    "summary": "Connection unavailable" + (" — " + endpoint["host"] if self._label_key(endpoint["host"]) not in ("", "local", "localhost", "127.0.0.1", "::1") else ""),
+                    "body": "Offline" + (" · session " + endpoint["session"] if self._label_key(endpoint["session"]) not in ("", "default") else "") + "\nLast known attention remains in the list.",
+                    "status": "offline",
                     "actions": [{"id": "show", "label": "Show attention"}],
                     "entry_ids": [endpoint["id"]],
                     "urgency": 1,
@@ -941,21 +1026,6 @@ class AttentionEngine:
                 })
         return effects
 
-    def _notice_body(self, records):
-        first = records[0]
-        names = ", ".join(record["agent"] for record in records[:4])
-        if len(records) > 4:
-            names += " (+%d more)" % (len(records) - 4)
-        location = first["host"] + " · " + first["session"]
-        if len(records) == 1 and first["tab"]:
-            location += " · tab " + first["tab"]
-        return names + "\n" + location
-
-    def _notice_actions(self, record=None):
-        can_open = record is not None and record["connected"] and record["can_open"]
-        return [{"id": "open" if can_open else "show", "label": "Open agent" if can_open else "Show attention"},
-                {"id": "snooze", "label": "Snooze %dm" % self.settings["snoozeMinutes"]},
-                {"id": "mute", "label": "Mute workspace"}]
 
     def tick(self):
         now = self.clock()
@@ -989,7 +1059,7 @@ class AttentionEngine:
             for records in release_groups.values():
                 effects.append(self._start_notification(
                     _hash_id("group:", records[0]["server"], records[0]["project_id"]), records,
-                    "Pending attention — " + records[0]["workspace"], self._notice_body(records), self._notice_actions(),
+                    self._notice_summary(records), self._notice_body(records), self._notice_actions(),
                 ))
                 consumed.update(record["id"] for record in records)
 
@@ -1006,14 +1076,13 @@ class AttentionEngine:
                 if len(records) == 1:
                     record = records[0]
                     effects.append(self._start_notification(
-                        "entry:" + record["id"], records, "Finished — " + record["workspace"],
-                        self._notice_body(records), self._notice_actions(record),
+                        "entry:" + record["id"], records, self._notice_summary(records),
+                        self._notice_body(records), self._notice_actions(),
                     ))
                 else:
                     effects.append(self._start_notification(
                         _hash_id("group:", records[0]["server"], records[0]["project_id"]), records,
-                        "%d agents finished — " % len(records) + records[0]["workspace"],
-                        self._notice_body(records), self._notice_actions(),
+                        self._notice_summary(records), self._notice_body(records), self._notice_actions(),
                     ))
                 consumed.update(record["id"] for record in records)
 
@@ -1021,8 +1090,8 @@ class AttentionEngine:
                 if record["id"] in consumed:
                     continue
                 effects.append(self._start_notification(
-                    "entry:" + record["id"], [record], "Needs input — " + record["workspace"],
-                    self._notice_body([record]), self._notice_actions(record),
+                    "entry:" + record["id"], [record], self._notice_summary([record]),
+                    self._notice_body([record]), self._notice_actions(),
                 ))
 
         close_effects = [{"op": "close", "key": key} for key in sorted(self._pending_closes)]

@@ -19,11 +19,14 @@ def _startup_error(message):
 
 try:
     import gi
+    import cairo
 
     gi.require_version("Gio", "2.0")
-    from gi.repository import Gio, GLib
+    gi.require_version("Rsvg", "2.0")
+    gi.require_foreign("cairo")
+    from gi.repository import Gio, GLib, Rsvg
 except Exception:
-    _startup_error("Attention backend unavailable: PyGObject Gio is required")
+    _startup_error("Attention backend unavailable: PyGObject Gio, Cairo and librsvg are required")
     raise SystemExit(1)
 
 try:
@@ -57,6 +60,20 @@ MAX_CLOSE_INFLIGHT = 16
 CALL_TIMEOUT_MS = 2500
 NOTIFY_TIMEOUT_MS = 4000
 ALLOWED_COMMANDS = frozenset(("open", "show", "snooze", "unsnooze", "mute", "unmute", "clear_mutes"))
+
+NOTIFICATION_ACTIONS = frozenset(("open", "show"))
+NOTIFICATION_STATUSES = frozenset(("blocked", "done", "offline"))
+ICON_SIZE = 64
+MAX_ICON_CACHE = 16
+DEFAULT_NOTIFICATION_STYLE = {
+    "glyph": "●",
+    "fontFamily": "sans-serif",
+    "background": "#1E1E2E",
+    "blocked": "#F38BA8",
+    "done": "#A6E3A1",
+    "working": "#F9E2AF",
+    "offline": "#7F849C",
+}
 
 INTROSPECTION_XML = """
 <node>
@@ -120,6 +137,93 @@ def _opaque_id(value, limit=512):
     if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
         return None
     return value
+
+
+def _hex_color(value):
+    if (
+        not isinstance(value, str)
+        or len(value) != 7
+        or value[0] != "#"
+        or any(char not in "0123456789abcdefABCDEF" for char in value[1:])
+    ):
+        return None
+    return value.upper()
+
+
+def _xml_text(value, limit):
+    text = _bounded_text(value, limit)
+    if text is None or any(
+        0xD800 <= ord(char) <= 0xDFFF or (ord(char) & 0xFFFF) in (0xFFFE, 0xFFFF)
+        for char in text
+    ):
+        return None
+    return text
+
+
+def _validated_notification_style(value):
+    if not isinstance(value, dict):
+        return dict(DEFAULT_NOTIFICATION_STYLE)
+    glyph = _xml_text(value.get("glyph"), 32)
+    font_family = _xml_text(value.get("fontFamily"), 128)
+    colors = {
+        name: _hex_color(value.get(name))
+        for name in ("background", "blocked", "done", "working", "offline")
+    }
+    if not glyph or not font_family or any(color is None for color in colors.values()):
+        return dict(DEFAULT_NOTIFICATION_STYLE)
+    return {"glyph": glyph, "fontFamily": font_family, **colors}
+
+
+def _blend_color(background, foreground, foreground_parts=3, total_parts=20):
+    mixed = []
+    for offset in (1, 3, 5):
+        base = int(background[offset:offset + 2], 16)
+        tint = int(foreground[offset:offset + 2], 16)
+        mixed.append((base * (total_parts - foreground_parts) + tint * foreground_parts) // total_parts)
+    return "#%02X%02X%02X" % tuple(mixed)
+
+
+def _rasterize_notification_icon(style, status):
+    color = style[status]
+    fill = _blend_color(style["background"], color)
+    glyph = html.escape(style["glyph"], quote=True)
+    font_family = html.escape(style["fontFamily"], quote=True)
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+        '<rect x="2" y="2" width="60" height="60" rx="14" fill="%s" stroke="%s" stroke-width="3"/>'
+        '<text x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
+        'font-family="%s" font-size="36" font-weight="700" fill="%s">%s</text>'
+        '</svg>'
+    ) % (fill, color, font_family, color, glyph)
+    # Render our own bounded SVG directly. Generic image loaders can launch
+    # sandboxed decoder processes, which are unnecessary for generated icons.
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, ICON_SIZE, ICON_SIZE)
+    viewport = Rsvg.Rectangle()
+    viewport.x = viewport.y = 0
+    viewport.width = viewport.height = ICON_SIZE
+    handle = Rsvg.Handle.new_from_data(svg.encode("utf-8"))
+    if not handle.render_document(cairo.Context(surface), viewport):
+        raise ValueError("SVG renderer did not render the icon")
+    surface.flush()
+    data = surface.get_data()
+    stride = surface.get_stride()
+    pixels = bytearray(ICON_SIZE * ICON_SIZE * 4)
+    # Cairo uses native-endian premultiplied ARGB; the notification protocol
+    # requires straight RGBA, including the antialiased transparent edges.
+    for y in range(ICON_SIZE):
+        for x in range(ICON_SIZE):
+            source = y * stride + x * 4
+            pixel = int.from_bytes(data[source:source + 4], sys.byteorder)
+            alpha = pixel >> 24
+            target = (y * ICON_SIZE + x) * 4
+            pixels[target + 3] = alpha
+            if alpha:
+                for channel, shift in enumerate((16, 8, 0)):
+                    pixels[target + channel] = min(255, (((pixel >> shift) & 255) * 255 + alpha // 2) // alpha)
+    return GLib.Variant(
+        "(iiibiiay)",
+        (ICON_SIZE, ICON_SIZE, ICON_SIZE * 4, True, 8, 4, bytes(pixels)),
+    )
 
 
 def _validate_tree(root):
@@ -273,6 +377,8 @@ class Bridge:
         self.command_queue = collections.deque()
         self.command_call_inflight = False
         self.get_view_inflight = False
+        self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
+        self.notification_icon_cache = collections.OrderedDict()
         self.publishers = collections.OrderedDict()
         self.publisher = None
 
@@ -562,6 +668,8 @@ class Bridge:
                 self.connection.unregister_object(self.registration_id)
             except GLib.Error:
                 pass
+        self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
+        self.notification_icon_cache.clear()
         self.registration_id = 0
         self.engine = None
         self.state_file = None
@@ -637,6 +745,9 @@ class Bridge:
             self.publisher = sender
         if sender != self.publisher:
             return
+        self.notification_style = _validated_notification_style(
+            settings.get("_notificationStyle")
+        )
         if self.transport_error == "No active bar publisher":
             self.transport_error = ""
         try:
@@ -758,6 +869,7 @@ class Bridge:
                     state, settings = self.publishers[self.publisher]
                     self._leader_update(state, settings, self.publisher)
                 elif self.engine is not None:
+                    self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
                     self.engine.update({"servers": []}, {"notifications": False})
                     self.transport_error = "No active bar publisher"
                     self._run_engine_tick()
@@ -918,21 +1030,24 @@ class Bridge:
                 continue
             notification_id = record.get("id")
             actions = record.get("actions", [])
+            target = _opaque_id(record.get("target", ""), 96)
             if (
                 isinstance(notification_id, bool)
                 or not isinstance(notification_id, int)
                 or not (0 < notification_id <= 0xFFFFFFFF)
                 or not isinstance(actions, list)
                 or len(actions) > 8
+                or target is None
             ):
                 continue
             allowed = []
             for action in actions:
-                if action in ALLOWED_COMMANDS and action not in allowed:
+                if isinstance(action, str) and action in NOTIFICATION_ACTIONS and action not in allowed:
                     allowed.append(action)
             clean[key] = {
                 "id": notification_id,
                 "actions": frozenset(allowed),
+                "target": target,
                 "generation": 0,
                 # Policy action tokens belong to the previous helper process.
                 # Retire its popups; the durable attention queue is restored separately.
@@ -952,6 +1067,7 @@ class Bridge:
             records[key] = {
                 "id": slot["id"],
                 "actions": sorted(slot["actions"]),
+                "target": slot.get("target", ""),
                 "closing": bool(slot.get("closing")),
             }
         try:
@@ -1122,6 +1238,7 @@ class Bridge:
         summary = _bounded_text(effect.get("summary"), 160)
         body = _bounded_text(effect.get("body"), 2048, multiline=True)
         actions = effect.get("actions")
+        status = _bounded_text(effect.get("status"), 16)
         entry_ids = effect.get("entry_ids")
         target = _opaque_id(entry_ids[0], 96) if isinstance(entry_ids, list) and entry_ids else None
         timeout_ms = effect.get("timeout_ms", 8000)
@@ -1129,34 +1246,32 @@ class Bridge:
             summary is None
             or body is None
             or target is None
+            or status not in NOTIFICATION_STATUSES
             or not isinstance(actions, list)
-            or len(actions) > 8
+            or len(actions) != 1
             or isinstance(timeout_ms, bool)
             or not isinstance(timeout_ms, int)
             or not (1000 <= timeout_ms <= 30000)
         ):
             self._notification_failed(key, token)
             return
-        clean_actions = []
-        seen = set()
-        for action in actions:
-            if not isinstance(action, dict):
-                self._notification_failed(key, token)
-                return
-            action_id = action.get("id")
-            label = _bounded_text(action.get("label"), 80)
-            if action_id not in ALLOWED_COMMANDS or label is None or action_id in seen:
-                self._notification_failed(key, token)
-                return
-            seen.add(action_id)
-            clean_actions.append((action_id, label))
+        action = actions[0]
+        if not isinstance(action, dict):
+            self._notification_failed(key, token)
+            return
+        action_id = action.get("id")
+        label = _bounded_text(action.get("label"), 80)
+        if not isinstance(action_id, str) or action_id not in NOTIFICATION_ACTIONS or not label:
+            self._notification_failed(key, token)
+            return
         clean = {
             "key": key,
             "token": token,
             "target": target,
+            "status": status,
             "summary": summary,
             "body": body,
-            "actions": clean_actions,
+            "action": (action_id, label),
             "timeout_ms": timeout_ms,
         }
         previous = self.pending_notifies.pop(key, None)
@@ -1194,6 +1309,31 @@ class Bridge:
             effect = self.pending_notifies.pop(key)
             self._send_notification(effect)
 
+    def _notification_image(self, status):
+        style = self.notification_style
+        cache_key = (
+            status,
+            style["glyph"],
+            style["fontFamily"],
+            style["background"],
+            style["blocked"],
+            style["done"],
+            style["working"],
+            style["offline"],
+        )
+        image = self.notification_icon_cache.get(cache_key)
+        if image is not None:
+            self.notification_icon_cache.move_to_end(cache_key)
+            return image
+        try:
+            image = _rasterize_notification_icon(style, status)
+        except Exception:
+            return None
+        self.notification_icon_cache[cache_key] = image
+        if len(self.notification_icon_cache) > MAX_ICON_CACHE:
+            self.notification_icon_cache.popitem(last=False)
+        return image
+
     def _send_notification(self, effect):
         key = effect["key"]
         token = effect["token"]
@@ -1202,25 +1342,23 @@ class Bridge:
             return
         slot = self.slots.get(key)
         replaces_id = slot["id"] if slot is not None and not slot.get("closing") else 0
-        action_words = []
-        primary = next((item for item in effect["actions"] if item[0] == "open"), None)
-        if primary is None:
-            primary = next((item for item in effect["actions"] if item[0] == "show"), None)
-        if primary is not None:
-            action_words.extend(("default", html.escape(primary[1], quote=False)))
-        for action_id, label in effect["actions"]:
-            action_words.extend((action_id, html.escape(label, quote=False)))
+        action_id, label = effect["action"]
+        image = self._notification_image(effect["status"])
+        if image is None:
+            self._notification_failed(key, token)
+            self.transport_error = "Desktop notification icon rendering failed"
+            return
+        action_words = ["default", html.escape(label, quote=False)]
         hints = {
             "urgency": GLib.Variant("y", 1),
             "suppress-sound": GLib.Variant("b", True),
-        }
-        if primary is not None:
+            "image-data": image,
             # Omarchy persists this argv when the original D-Bus sender exits.
-            # Use a durable attention ID: dismissing a toast retires its slot
-            # before the shell has necessarily dispatched the click command.
-            hints["omarchy-exec-argv"] = GLib.Variant("s", json.dumps([
-                "omarchy-shell", "njpatel.omaherdr", "notice", primary[0], effect["target"],
-            ], separators=(",", ":")))
+            # Use the same durable entry ID as the native default action.
+            "omarchy-exec-argv": GLib.Variant("s", json.dumps([
+                "omarchy-shell", "njpatel.omaherdr", "notice", action_id, effect["target"],
+            ], separators=(",", ":"))),
+        }
         parameters = GLib.Variant(
             "(susssasa{sv}i)",
             (
@@ -1239,7 +1377,8 @@ class Bridge:
         pending = {
             "key": key,
             "token": token,
-            "actions": frozenset(action_id for action_id, _label in effect["actions"]),
+            "actions": frozenset((action_id,)),
+            "target": effect["target"],
             "owner": self.notification_owner,
             "notification_generation": self.notification_generation,
             "role_generation": self.role_generation,
@@ -1300,6 +1439,7 @@ class Bridge:
             self.slots[key] = {
                 "id": notification_id,
                 "actions": pending["actions"],
+                "target": pending["target"],
                 "generation": self.slot_generation,
                 "closing": False,
             }
@@ -1309,6 +1449,7 @@ class Bridge:
                 "Desktop notification service unavailable",
                 "Desktop notification delivery failed",
                 "Desktop notification closure failed",
+                "Desktop notification icon rendering failed",
             ):
                 self.transport_error = ""
         elif not cancelled:
@@ -1446,12 +1587,14 @@ class Bridge:
         slot = self.slots.get(key) if key is not None else None
         if slot is None or slot.get("closing"):
             return
-        if action_id == "default":
-            action_id = "open" if "open" in slot["actions"] else "show"
-        if action_id not in slot["actions"]:
+        if action_id != "default" or len(slot["actions"]) != 1:
+            return
+        logical_action = next(iter(slot["actions"]))
+        target = _opaque_id(slot.get("target"), 96)
+        if logical_action not in NOTIFICATION_ACTIONS or target is None:
             return
         try:
-            result = _validated_action(self.engine.command(action_id, key))
+            result = _validated_action(self.engine.command(logical_action, target))
         except Exception:
             self.transport_error = "Attention notification action failed"
             self._emit_view()

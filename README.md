@@ -24,7 +24,7 @@ omarchy restart shell
 
 Nothing to configure. Omaherdr finds every `herdr` you are attached to from this desktop - plain, `--session NAME`, or `--remote HOST` - by looking at the processes in your terminal windows, then talks to each server over its socket (through `ssh HOST` for remote ones, which needs a key that works non-interactively and `python3` on the far side). A local server running with nobody attached is listed too.
 
-Needs herdr 0.8 or newer and `python3`; remote hosts need non-interactive SSH access and `python3` too. The attention view and desktop notifications additionally use local PyGObject/Gio (`python-gobject` on Arch). The remote helper remains Python-standard-library-only.
+Needs herdr 0.8 or newer and `python3`; remote hosts need non-interactive SSH access and `python3` too. The attention view and desktop notifications additionally use local PyGObject/Gio, Cairo and librsvg (`python-gobject`, `python-cairo`, `librsvg` on Arch). The remote helper remains Python-standard-library-only.
 
 Local and standalone `--remote` discovery, live status and jumps have been checked with herdr 0.9.0 and foot 1.27.0, including a real OpenCode 1.18.30 agent completing background work and changing from done to idle when its row is clicked. Snapshot and event handling also work with herdr 0.8.2.
 
@@ -66,7 +66,17 @@ omarchy bar set njpatel.omaherdr watchSavedMachines true
 
 The second setting is optional and permits background SSH monitoring of enabled saved profiles, even without an attached terminal. Existing SSH trust and authentication must already work non-interactively. Omaherdr does not change herdr configuration or start replacement servers.
 
-New needs-input episodes produce one alert; completions are grouped by server and workspace. Popup activation opens the current agent when safe, or the attention list. Dismissing a popup never answers or acknowledges a request. Omarchy's persisted click action uses an opaque attention identity, so a toast retained after a helper restart still opens current attention rather than relying on a dead sender. Notification servers that render action buttons can also expose snooze and mute; both are always available in the attention panel.
+New needs-input episodes produce one alert; completions are grouped by server and workspace. Each toast provides only a default action: try opening the current agent (the first listed agent for a group), or show the attention list if a safe jump is unavailable. Connection alerts open the attention list. Dismissing a popup never answers or acknowledges a request. No separate snooze or mute actions are sent to the notification renderer; its own controls remain its responsibility. Existing attention-panel snooze and mute controls remain available.
+
+The notification icon uses your selected `barIcon` and font inside a state-tinted box: theme red for needs-input, green for done and muted colour for connection loss. Icons are rendered locally in memory and sent as standard raw image data, not fetched from a website or written to icon files. The title names the state and workspace; the body keeps meaningful agent/tab names and remote/session context, omitting numeric tabs and duplicate labels.
+
+Omapager may display the default action as its own **Open in app** button. Card-body clicks invoke it only when Omapager's `allowDefaultActionOnCardClick` setting is enabled; Omaherdr never changes that setting. The explicit button remains usable with it disabled. Enabling it applies to all notification senders, not just Omaherdr:
+
+```sh
+omarchy bar set njpatel.omapager allowDefaultActionOnCardClick true --json
+```
+
+The stock Omarchy renderer also receives a persisted click action using the same opaque attention identity, so its retained toast can still navigate after the original sender exits. Omapager uses live native actions instead; restoration and history behaviour belong to the renderer.
 
 | setting | default | behaviour |
 |---|---|---|
@@ -79,7 +89,7 @@ New needs-input episodes produce one alert; completions are grouped by server an
 
 Set each with `omarchy bar set njpatel.omaherdr SETTING VALUE`. Quiet hours suppress popups, not the queue. Startup, reconnect and enabling notifications establish a baseline rather than replaying every pending item. A sustained connection failure produces one endpoint alert, not one per agent. Multiple widget copies share one notification publisher, preventing duplicate alerts.
 
-Notifications contain bounded agent/workspace labels and state only: no terminal transcripts, command previews, question text or inline replies/approvals. They use the desktop notification service, whose own history and do-not-disturb policy still apply. Missing attention or notification services are reported in the panel; ordinary discovery remains available.
+Herdr 0.9 exposes terminal snapshots, but no structured last-assistant-message field. Omaherdr therefore uses the state and location context above; it does not scrape terminal UI text or read agent session files to invent a reply preview. Notifications contain no terminal transcripts, command previews, question text or inline replies/approvals. The desktop notification service's own history and do-not-disturb policy still apply. Missing attention or notification services are reported in the panel; ordinary discovery remains available.
 
 ## Removing
 

@@ -79,6 +79,7 @@ Panel {
   function attentionSettings() {
     return {
       _activeWidget: root.bar !== null,
+      _notificationStyle: notificationStyle,
       notifications: notifications,
       notifyDone: notifyDone,
       completionDelaySec: completionDelaySec,
@@ -96,6 +97,7 @@ Panel {
   onQuietStartChanged: queueAttentionSettings()
   onQuietEndChanged: queueAttentionSettings()
   onWatchSavedMachinesChanged: queueAttentionSettings()
+  onNotificationStyleChanged: queueAttentionSettings()
   onBarChanged: queueAttentionSettings()
   function toggleNotifications() {
     notifications = !notifications
@@ -119,6 +121,22 @@ Panel {
   readonly property color yellow: palette.bright_yellow || palette.yellow || accent
   readonly property color green: palette.bright_green || palette.green || accent
   readonly property color grey: Color.muted || dim
+
+  function rgbHex(value) {
+    var channels = [value.r, value.g, value.b], text = "#"
+    for (var i = 0; i < channels.length; i++)
+      text += ("0" + Math.round(channels[i] * 255).toString(16)).slice(-2)
+    return text
+  }
+  readonly property var notificationStyle: ({
+    glyph: String(barIcon).slice(0, 32),
+    fontFamily: String(fontFamily).slice(0, 128),
+    background: rgbHex(Color.notifications.background),
+    blocked: rgbHex(red),
+    done: rgbHex(green),
+    working: rgbHex(yellow),
+    offline: rgbHex(grey)
+  })
   FileView {
     path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
     watchChanges: true

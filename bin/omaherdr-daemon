@@ -43,7 +43,8 @@ PREFER_TERMINAL = ""      # window-class substring that wins the ranking; --pref
 SNAPSHOT_EVERY = 60.0
 DEBOUNCE = 0.25
 NOTIFICATION_DEFAULTS = {"notifications": False, "notifyDone": True, "completionDelaySec": 3,
-                         "snoozeMinutes": 10, "quietStart": "", "quietEnd": "", "watchSavedMachines": False, "_activeWidget": False}
+                         "snoozeMinutes": 10, "quietStart": "", "quietEnd": "", "watchSavedMachines": False,
+                         "_activeWidget": False, "_notificationStyle": {}}
 
 events = queue.Queue()
 
@@ -525,7 +526,7 @@ class NotificationBridge(Helper):
     def publish(self, servers, settings):
         if settings.get("_activeWidget") is not True:
             return
-        payload = {"op": "state", "state": attention_input(servers), "settings": {key: value for key, value in settings.items() if not key.startswith("_")}}
+        payload = {"op": "state", "state": attention_input(servers), "settings": {key: value for key, value in settings.items() if key != "_activeWidget"}}
         serialised = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if serialised != self.last_state:
             self.pending_state = serialised
