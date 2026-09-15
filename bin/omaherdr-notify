@@ -190,8 +190,8 @@ def _rasterize_notification_icon(style, status):
     font_family = html.escape(style["fontFamily"], quote=True)
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
-        '<rect x="2" y="2" width="60" height="60" rx="14" fill="%s" stroke="%s" stroke-width="3"/>'
-        '<text x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
+        '<rect id="frame" x="2" y="2" width="60" height="60" rx="14" fill="%s" stroke="%s" stroke-width="3"/>'
+        '<text id="glyph" x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
         'font-family="%s" font-size="36" font-weight="700" fill="%s">%s</text>'
         '</svg>'
     ) % (fill, color, font_family, color, glyph)
@@ -202,8 +202,16 @@ def _rasterize_notification_icon(style, status):
     viewport.x = viewport.y = 0
     viewport.width = viewport.height = ICON_SIZE
     handle = Rsvg.Handle.new_from_data(svg.encode("utf-8"))
-    if not handle.render_document(cairo.Context(surface), viewport):
-        raise ValueError("SVG renderer did not render the icon")
+    measured, ink, _logical = handle.get_geometry_for_layer("#glyph", viewport)
+    context = cairo.Context(surface)
+    if not measured or not handle.render_layer(context, "#frame", viewport):
+        raise ValueError("SVG renderer did not measure or render the icon frame")
+    # Nerd Font glyphs have different bearings and ascenders. Align their ink,
+    # not their advance width or baseline, with the centre of the fixed frame.
+    context.translate(ICON_SIZE / 2 - ink.x - ink.width / 2,
+                      ICON_SIZE / 2 - ink.y - ink.height / 2)
+    if not handle.render_layer(context, "#glyph", viewport):
+        raise ValueError("SVG renderer did not render the icon glyph")
     surface.flush()
     data = surface.get_data()
     stride = surface.get_stride()
