@@ -1,3 +1,16 @@
+## Unreleased
+
+- Add opt-in needs-input and grouped completion notifications, with a persistent attention view, snooze, workspace mute and quiet hours.
+- Use the selected panel icon inside a theme-coloured state box and provide only a default notification action, leaving notification snooze/mute controls to the renderer.
+- Centre notification glyphs by their painted bounds rather than font baselines, keeping different icon shapes aligned inside the frame.
+- Keep useful workspace, agent and nonnumeric tab names in notification context. Herdr 0.9 has no structured last-message field; terminal snapshots are not presented as assistant replies.
+- Monitor enabled herdr 0.9 saved-machine profiles when explicitly enabled. Notification navigation requires a dedicated client window; combined-client targets open the attention list instead.
+- Share notification delivery across widget copies and preserve current attention across reconnects and helper replacement without replaying old alerts.
+- Keep retained Omarchy notification clicks usable after the original sender exits. Notifications never expose transcripts or answer agent requests.
+- Attention features require local PyGObject/Gio, Cairo and librsvg; remote helpers remain standard-library-only.
+
+## v1.1.0
+
 Omaherdr v1.1.0 improves jumps when several terminal windows, tabs or panes host herdr.
 
 ## New

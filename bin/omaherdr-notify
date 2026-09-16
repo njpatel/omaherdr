@@ -1,0 +1,1759 @@
+#!/usr/bin/python3
+# Local attention-policy and freedesktop-notification bridge for Omaherdr.
+# The remote omaherdr-helper deliberately remains Python-stdlib-only.
+import collections
+import html
+import math
+import json
+import os
+import sys
+
+
+def _startup_error(message):
+    try:
+        sys.stdout.write(json.dumps({"kind": "error", "message": message}, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+try:
+    import gi
+    import cairo
+
+    gi.require_version("Gio", "2.0")
+    gi.require_version("Rsvg", "2.0")
+    gi.require_foreign("cairo")
+    from gi.repository import Gio, GLib, Rsvg
+except Exception:
+    _startup_error("Attention backend unavailable: PyGObject Gio, Cairo and librsvg are required")
+    raise SystemExit(1)
+
+try:
+    from omaherdr_attention import AttentionEngine, SafeStateFile
+except Exception:
+    _startup_error("Attention policy module unavailable")
+    raise SystemExit(1)
+
+
+BUS_NAME = "org.omarchy.Omaherdr.Attention"
+OBJECT_PATH = "/org/omarchy/Omaherdr/Attention"
+INTERFACE = "org.omarchy.Omaherdr.Attention"
+NOTIFY_NAME = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+NOTIFY_INTERFACE = "org.freedesktop.Notifications"
+DBUS_NAME = "org.freedesktop.DBus"
+DBUS_PATH = "/org/freedesktop/DBus"
+DBUS_INTERFACE = "org.freedesktop.DBus"
+
+MAX_LINE_BYTES = 1024 * 1024
+MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_OUTPUT_QUEUE_BYTES = 2 * MAX_OUTPUT_BYTES
+MAX_DBUS_BYTES = 1024 * 1024
+MAX_TREE_DEPTH = 32
+MAX_TREE_NODES = 50000
+MAX_COMMAND_QUEUE = 64
+MAX_SLOTS = 512
+MAX_EFFECTS = 512
+MAX_NOTIFY_INFLIGHT = 16
+MAX_CLOSE_INFLIGHT = 16
+CALL_TIMEOUT_MS = 2500
+NOTIFY_TIMEOUT_MS = 4000
+ALLOWED_COMMANDS = frozenset(("open", "show", "snooze", "unsnooze", "mute", "unmute", "clear_mutes"))
+
+NOTIFICATION_ACTIONS = frozenset(("open", "show"))
+NOTIFICATION_STATUSES = frozenset(("blocked", "done", "offline"))
+ICON_SIZE = 64
+MAX_ICON_CACHE = 16
+DEFAULT_NOTIFICATION_STYLE = {
+    "glyph": "●",
+    "fontFamily": "sans-serif",
+    "background": "#1E1E2E",
+    "blocked": "#F38BA8",
+    "done": "#A6E3A1",
+    "working": "#F9E2AF",
+    "offline": "#7F849C",
+}
+
+INTROSPECTION_XML = """
+<node>
+  <interface name="org.omarchy.Omaherdr.Attention">
+    <method name="PublishState">
+      <arg name="state" type="s" direction="in"/>
+      <arg name="settings" type="s" direction="in"/>
+      <arg name="attention" type="s" direction="out"/>
+    </method>
+    <method name="RunCommand">
+      <arg name="action" type="s" direction="in"/>
+      <arg name="target" type="s" direction="in"/>
+      <arg name="result" type="s" direction="out"/>
+      <arg name="attention" type="s" direction="out"/>
+    </method>
+    <method name="GetView">
+      <arg name="attention" type="s" direction="out"/>
+    </method>
+    <signal name="ViewChanged">
+      <arg name="attention" type="s"/>
+    </signal>
+    <signal name="ActionRequested">
+      <arg name="action" type="s"/>
+    </signal>
+  </interface>
+</node>
+"""
+INTERFACE_INFO = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML).interfaces[0]
+
+
+def _json_bytes(value, limit):
+    data = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(data) > limit:
+        raise ValueError("JSON record exceeds limit")
+    return data
+
+
+def _json_text(value, limit=MAX_DBUS_BYTES):
+    return _json_bytes(value, limit).decode("utf-8")
+
+
+def _bounded_text(value, limit, multiline=False):
+    if not isinstance(value, str):
+        return None
+    out = []
+    for char in value:
+        code = ord(char)
+        if code == 0 or code == 0x7F or (code < 0x20 and not (multiline and char in "\n\t")):
+            continue
+        out.append(char)
+        if len(out) >= limit:
+            break
+    return "".join(out)
+
+
+def _opaque_id(value, limit=512):
+    if not isinstance(value, str) or len(value) > limit:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    return value
+
+
+def _hex_color(value):
+    if (
+        not isinstance(value, str)
+        or len(value) != 7
+        or value[0] != "#"
+        or any(char not in "0123456789abcdefABCDEF" for char in value[1:])
+    ):
+        return None
+    return value.upper()
+
+
+def _xml_text(value, limit):
+    text = _bounded_text(value, limit)
+    if text is None or any(
+        0xD800 <= ord(char) <= 0xDFFF or (ord(char) & 0xFFFF) in (0xFFFE, 0xFFFF)
+        for char in text
+    ):
+        return None
+    return text
+
+
+def _validated_notification_style(value):
+    if not isinstance(value, dict):
+        return dict(DEFAULT_NOTIFICATION_STYLE)
+    glyph = _xml_text(value.get("glyph"), 32)
+    font_family = _xml_text(value.get("fontFamily"), 128)
+    colors = {
+        name: _hex_color(value.get(name))
+        for name in ("background", "blocked", "done", "working", "offline")
+    }
+    if not glyph or not font_family or any(color is None for color in colors.values()):
+        return dict(DEFAULT_NOTIFICATION_STYLE)
+    return {"glyph": glyph, "fontFamily": font_family, **colors}
+
+
+def _blend_color(background, foreground, foreground_parts=3, total_parts=20):
+    mixed = []
+    for offset in (1, 3, 5):
+        base = int(background[offset:offset + 2], 16)
+        tint = int(foreground[offset:offset + 2], 16)
+        mixed.append((base * (total_parts - foreground_parts) + tint * foreground_parts) // total_parts)
+    return "#%02X%02X%02X" % tuple(mixed)
+
+
+def _rasterize_notification_icon(style, status):
+    color = style[status]
+    fill = _blend_color(style["background"], color)
+    glyph = html.escape(style["glyph"], quote=True)
+    font_family = html.escape(style["fontFamily"], quote=True)
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+        '<rect id="frame" x="2" y="2" width="60" height="60" rx="14" fill="%s" stroke="%s" stroke-width="3"/>'
+        '<text id="glyph" x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
+        'font-family="%s" font-size="36" font-weight="700" fill="%s">%s</text>'
+        '</svg>'
+    ) % (fill, color, font_family, color, glyph)
+    # Render our own bounded SVG directly. Generic image loaders can launch
+    # sandboxed decoder processes, which are unnecessary for generated icons.
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, ICON_SIZE, ICON_SIZE)
+    viewport = Rsvg.Rectangle()
+    viewport.x = viewport.y = 0
+    viewport.width = viewport.height = ICON_SIZE
+    handle = Rsvg.Handle.new_from_data(svg.encode("utf-8"))
+    measured, ink, _logical = handle.get_geometry_for_layer("#glyph", viewport)
+    context = cairo.Context(surface)
+    if not measured or not handle.render_layer(context, "#frame", viewport):
+        raise ValueError("SVG renderer did not measure or render the icon frame")
+    # Nerd Font glyphs have different bearings and ascenders. Align their ink,
+    # not their advance width or baseline, with the centre of the fixed frame.
+    context.translate(ICON_SIZE / 2 - ink.x - ink.width / 2,
+                      ICON_SIZE / 2 - ink.y - ink.height / 2)
+    if not handle.render_layer(context, "#glyph", viewport):
+        raise ValueError("SVG renderer did not render the icon glyph")
+    surface.flush()
+    data = surface.get_data()
+    stride = surface.get_stride()
+    pixels = bytearray(ICON_SIZE * ICON_SIZE * 4)
+    # Cairo uses native-endian premultiplied ARGB; the notification protocol
+    # requires straight RGBA, including the antialiased transparent edges.
+    for y in range(ICON_SIZE):
+        for x in range(ICON_SIZE):
+            source = y * stride + x * 4
+            pixel = int.from_bytes(data[source:source + 4], sys.byteorder)
+            alpha = pixel >> 24
+            target = (y * ICON_SIZE + x) * 4
+            pixels[target + 3] = alpha
+            if alpha:
+                for channel, shift in enumerate((16, 8, 0)):
+                    pixels[target + channel] = min(255, (((pixel >> shift) & 255) * 255 + alpha // 2) // alpha)
+    return GLib.Variant(
+        "(iiibiiay)",
+        (ICON_SIZE, ICON_SIZE, ICON_SIZE * 4, True, 8, 4, bytes(pixels)),
+    )
+
+
+def _validate_tree(root):
+    nodes = 0
+    stack = [(root, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
+            return False
+        if value is None or isinstance(value, (bool, int)):
+            continue
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return False
+            continue
+        if isinstance(value, str):
+            if len(value.encode("utf-8")) > 65536:
+                return False
+            continue
+        if isinstance(value, list):
+            stack.extend((item, depth + 1) for item in value)
+            continue
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) or len(key) > 256 for key in value):
+                return False
+            stack.extend((item, depth + 1) for item in value.values())
+            continue
+        return False
+    return True
+
+
+def _fallback_view(message):
+    return {
+        "available": False,
+        "enabled": False,
+        "quiet": False,
+        "error": _bounded_text(message, 256) or "Attention backend unavailable",
+        "entries": [],
+        "muted_workspaces": [],
+        "counts": {"blocked": 0, "done": 0, "offline": 0},
+    }
+
+
+def _validated_action(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("kind") != "action":
+        return None
+    action = value.get("action")
+    if action == "go":
+        server = _opaque_id(value.get("server"))
+        pane_id = _opaque_id(value.get("id"))
+        terminal_id = _opaque_id(value.get("terminal_id"))
+        if server is None or pane_id is None or terminal_id is None or value.get("kind_target") != "pane":
+            return None
+        return {
+            "kind": "action",
+            "action": "go",
+            "server": server,
+            "kind_target": "pane",
+            "id": pane_id,
+            "terminal_id": terminal_id,
+        }
+    if action == "show_attention":
+        result = {"kind": "action", "action": "show_attention"}
+        if "filter" in value:
+            label = _bounded_text(value.get("filter"), 256)
+            if label is None:
+                return None
+            result["filter"] = label
+        return result
+    return None
+
+
+class OutputWriter:
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.fd = sys.stdout.fileno()
+        self.buffer = bytearray()
+        self.watch_id = 0
+        try:
+            os.set_blocking(self.fd, False)
+        except OSError:
+            pass
+
+    def write(self, value):
+        try:
+            data = _json_bytes(value, MAX_OUTPUT_BYTES) + b"\n"
+        except (TypeError, ValueError, UnicodeError):
+            data = b'{"kind":"error","message":"Attention output exceeded its safety limit"}\n'
+        if len(self.buffer) + len(data) > MAX_OUTPUT_QUEUE_BYTES:
+            self.bridge.begin_shutdown()
+            return
+        self.buffer.extend(data)
+        self._flush()
+
+    def _flush(self):
+        while self.buffer:
+            try:
+                count = os.write(self.fd, self.buffer)
+            except BlockingIOError:
+                break
+            except (BrokenPipeError, OSError):
+                self.bridge.begin_shutdown()
+                return
+            if count <= 0:
+                break
+            del self.buffer[:count]
+        if self.buffer and not self.watch_id:
+            self.watch_id = GLib.io_add_watch(
+                self.fd, GLib.IO_OUT | GLib.IO_ERR | GLib.IO_HUP, self._on_writable
+            )
+
+    def _on_writable(self, _fd, condition):
+        self.watch_id = 0
+        if condition & (GLib.IO_ERR | GLib.IO_HUP):
+            self.bridge.begin_shutdown()
+            return False
+        self._flush()
+        return False
+
+
+class Bridge:
+    def __init__(self):
+        self.loop = GLib.MainLoop()
+        self.output = OutputWriter(self)
+        self.connection = None
+        self.owner_id = 0
+        self.registration_id = 0
+        self.subscription_ids = []
+        self.stdin_watch_id = 0
+        self.stdin_idle_id = 0
+        self.stdin_buffer = bytearray()
+        self.discarding_line = False
+        self.shutting_down = False
+        self.shutdown_deadline_id = 0
+        self.is_leader = False
+        self.role_generation = 0
+
+        self.engine = None
+        self.state_file = None
+        self.persistence_ok = True
+        self.transport_save_deferred = 0
+        self.transport_save_pending = False
+        self.transport_error = ""
+        self.last_view_text = ""
+        self.last_local_state = None
+        self.pending_state = None
+        self.state_call_inflight = False
+        self.command_queue = collections.deque()
+        self.command_call_inflight = False
+        self.get_view_inflight = False
+        self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
+        self.notification_icon_cache = collections.OrderedDict()
+        self.publishers = collections.OrderedDict()
+        self.publisher = None
+
+        self.notification_owner = ""
+        self.notification_owner_known = False
+        self.notification_generation = 0
+        self.stored_owner = ""
+        self.stored_slots = {}
+        self.slots = {}
+        self.notification_ids = {}
+        self.slot_generation = 0
+        self.notify_sequence = 0
+        self.notify_inflight = {}
+        self.notify_keys_inflight = set()
+        self.pending_close_keys = set()
+        self.close_sequence = 0
+        self.close_inflight = {}
+        self.pending_close_requests = collections.OrderedDict()
+        self.pending_notifies = collections.OrderedDict()
+
+    def start(self):
+        try:
+            os.set_blocking(sys.stdin.fileno(), False)
+        except OSError:
+            pass
+        self.stdin_watch_id = GLib.io_add_watch(
+            sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_stdin
+        )
+        self.owner_id = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            self._on_bus_acquired,
+            self._on_name_acquired,
+            self._on_name_lost,
+        )
+        GLib.timeout_add_seconds(1, self._on_tick)
+        self.loop.run()
+
+    def error(self, message):
+        text = _bounded_text(message, 256) or "Attention backend error"
+        self.output.write({"kind": "error", "message": text})
+
+    def _on_stdin(self, _fd, condition):
+        eof = bool(condition & (GLib.IO_HUP | GLib.IO_ERR))
+        reads = 0
+        while reads < 4:
+            try:
+                chunk = os.read(sys.stdin.fileno(), 65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                chunk = b""
+            if not chunk:
+                eof = True
+                break
+            reads += 1
+            self._accept_input(chunk)
+        self._process_input_lines(32)
+        if eof:
+            if self.stdin_buffer and not self.discarding_line:
+                line = bytes(self.stdin_buffer)
+                self.stdin_buffer.clear()
+                self._handle_input_line(line)
+            self.begin_shutdown()
+            return False
+        return not self.shutting_down
+
+    def _accept_input(self, chunk):
+        offset = 0
+        while offset < len(chunk):
+            if self.discarding_line:
+                newline = chunk.find(b"\n", offset)
+                if newline < 0:
+                    return
+                self.discarding_line = False
+                offset = newline + 1
+                continue
+            newline = chunk.find(b"\n", offset)
+            end = len(chunk) if newline < 0 else newline + 1
+            self.stdin_buffer.extend(chunk[offset:end])
+            offset = end
+            if len(self.stdin_buffer) > MAX_LINE_BYTES + 1:
+                self.stdin_buffer.clear()
+                self.discarding_line = newline < 0
+                self.error("Attention request exceeded its safety limit")
+
+    def _process_input_lines(self, limit):
+        processed = 0
+        while processed < limit:
+            newline = self.stdin_buffer.find(b"\n")
+            if newline < 0:
+                break
+            line = bytes(self.stdin_buffer[:newline])
+            del self.stdin_buffer[: newline + 1]
+            self._handle_input_line(line)
+            processed += 1
+        if b"\n" in self.stdin_buffer and not self.stdin_idle_id:
+            self.stdin_idle_id = GLib.idle_add(self._continue_input)
+
+    def _continue_input(self):
+        self.stdin_idle_id = 0
+        self._process_input_lines(32)
+        return False
+
+    def _handle_input_line(self, raw):
+        if self.shutting_down or not raw.strip():
+            return
+        if len(raw) > MAX_LINE_BYTES:
+            self.error("Attention request exceeded its safety limit")
+            return
+        try:
+            request = json.loads(raw.decode("utf-8", "strict"))
+        except (UnicodeError, ValueError, RecursionError):
+            self.error("Invalid attention request")
+            return
+        if not isinstance(request, dict):
+            self.error("Invalid attention request")
+            return
+        op = request.get("op")
+        if op == "quit":
+            self.begin_shutdown()
+            return
+        if op == "state":
+            state = request.get("state")
+            settings = request.get("settings")
+            if not isinstance(state, dict) or not isinstance(settings, dict):
+                self.error("Invalid attention state")
+                return
+            if not _validate_tree(state) or not _validate_tree(settings):
+                self.error("Attention state exceeded its safety limit")
+                return
+            try:
+                state_text = _json_text(state)
+                settings_text = _json_text(settings)
+            except (TypeError, ValueError, UnicodeError):
+                self.error("Attention state exceeded its safety limit")
+                return
+            self.last_local_state = (state_text, settings_text)
+            if self.is_leader:
+                self._leader_update(state, settings)
+            else:
+                self.pending_state = (state_text, settings_text)
+                self._dispatch_state()
+            return
+        if op == "command":
+            action = request.get("action")
+            target = _opaque_id(request.get("target", ""), 96)
+            if action not in ALLOWED_COMMANDS or target is None:
+                self.error("Invalid attention command")
+                return
+            if self.is_leader:
+                result = self._leader_command(action, target)
+                if result is not None:
+                    self.output.write(result)
+            else:
+                if len(self.command_queue) >= MAX_COMMAND_QUEUE:
+                    self.error("Too many pending attention commands")
+                    return
+                self.command_queue.append((action, target))
+                self._dispatch_command()
+            return
+        self.error("Unknown attention request")
+
+    def _on_bus_acquired(self, connection, _name):
+        if self.shutting_down:
+            return
+        self.connection = connection
+        self.subscription_ids.append(
+            connection.signal_subscribe(
+                BUS_NAME,
+                INTERFACE,
+                "ViewChanged",
+                OBJECT_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_view_signal,
+            )
+        )
+        self.subscription_ids.append(
+            connection.signal_subscribe(
+                BUS_NAME, INTERFACE, "ActionRequested", OBJECT_PATH, None,
+                Gio.DBusSignalFlags.NONE, self._on_requested_action,
+            )
+        )
+        self.subscription_ids.append(
+            connection.signal_subscribe(
+                DBUS_NAME,
+                DBUS_INTERFACE,
+                "NameOwnerChanged",
+                DBUS_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_name_owner_changed,
+            )
+        )
+        self.subscription_ids.append(
+            connection.signal_subscribe(
+                None,
+                NOTIFY_INTERFACE,
+                "ActionInvoked",
+                NOTIFY_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_notification_action,
+            )
+        )
+        self.subscription_ids.append(
+            connection.signal_subscribe(
+                None,
+                NOTIFY_INTERFACE,
+                "NotificationClosed",
+                NOTIFY_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_notification_closed,
+            )
+        )
+        GLib.timeout_add(100, self._after_bus_ready)
+
+    def _after_bus_ready(self):
+        if not self.shutting_down and not self.is_leader:
+            self._request_view()
+            if self.last_local_state:
+                self.pending_state = self.last_local_state
+                self._dispatch_state()
+            self._dispatch_command()
+        return False
+
+    def _on_name_acquired(self, connection, _name):
+        if self.shutting_down:
+            return
+        self.connection = connection
+        self.is_leader = True
+        self.role_generation += 1
+        self.publishers.clear()
+        self.publisher = None
+        try:
+            self.registration_id = connection.register_object_with_closures2(
+                OBJECT_PATH, INTERFACE_INFO, self._on_method_call, None, None
+            )
+            self.engine = AttentionEngine()
+            self.state_file = SafeStateFile("notification-transport.json")
+            self._load_transport_state()
+        except Exception:
+            self.engine = None
+            self.transport_error = "Attention backend unavailable"
+            self.error(self.transport_error)
+            self._emit_view()
+            return
+        self.notification_owner_known = False
+        self._query_notification_owner()
+        if self.last_local_state:
+            try:
+                state = json.loads(self.last_local_state[0])
+                settings = json.loads(self.last_local_state[1])
+                self._leader_update(state, settings)
+            except (ValueError, RecursionError):
+                self.error("Invalid cached attention state")
+        else:
+            self._run_engine_tick()
+            self._emit_view()
+        while self.command_queue:
+            action, target = self.command_queue.popleft()
+            result = self._leader_command(action, target)
+            if result is not None:
+                self.output.write(result)
+
+    def _on_name_lost(self, connection, _name):
+        if self.shutting_down:
+            return
+        if self.is_leader:
+            self._drop_leadership()
+        if connection is None:
+            self.connection = None
+            self._deliver_view_object(_fallback_view("Session bus unavailable"))
+        else:
+            self.connection = connection
+
+    def _drop_leadership(self):
+        self.is_leader = False
+        self.role_generation += 1
+        self.publishers.clear()
+        self.publisher = None
+        if self.connection is not None and self.registration_id:
+            try:
+                self.connection.unregister_object(self.registration_id)
+            except GLib.Error:
+                pass
+        self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
+        self.notification_icon_cache.clear()
+        self.registration_id = 0
+        self.engine = None
+        self.state_file = None
+        self.slots.clear()
+        self.notification_ids.clear()
+        self.pending_notifies.clear()
+        self.notify_inflight.clear()
+        self.notify_keys_inflight.clear()
+        self.pending_close_keys.clear()
+        self.close_inflight.clear()
+        self.pending_close_requests.clear()
+        self.notification_owner_known = False
+        self.notification_owner = ""
+
+    def _on_method_call(
+        self,
+        _connection,
+        _sender,
+        _object_path,
+        _interface_name,
+        method_name,
+        parameters,
+        invocation,
+    ):
+        if not self.is_leader or self.engine is None:
+            invocation.return_dbus_error(INTERFACE + ".Unavailable", "Attention leader unavailable")
+            return
+        try:
+            if method_name == "PublishState":
+                state_text, settings_text = parameters.unpack()
+                if len(state_text.encode("utf-8")) > MAX_DBUS_BYTES or len(settings_text.encode("utf-8")) > MAX_DBUS_BYTES:
+                    raise ValueError("oversized state")
+                state = json.loads(state_text)
+                settings = json.loads(settings_text)
+                if not isinstance(state, dict) or not isinstance(settings, dict):
+                    raise ValueError("invalid state")
+                if not _validate_tree(state) or not _validate_tree(settings):
+                    raise ValueError("invalid state")
+                self._leader_update(state, settings, _sender)
+                invocation.return_value(GLib.Variant("(s)", (self._view_text(),)))
+                return
+            if method_name == "RunCommand":
+                action, target = parameters.unpack()
+                if action not in ALLOWED_COMMANDS or _opaque_id(target, 96) is None:
+                    raise ValueError("invalid command")
+                result = self._leader_command(action, target)
+                result_text = "" if result is None else _json_text(result, 65536)
+                invocation.return_value(GLib.Variant("(ss)", (result_text, self._view_text())))
+                return
+            if method_name == "GetView":
+                invocation.return_value(GLib.Variant("(s)", (self._view_text(),)))
+                return
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            invocation.return_dbus_error(INTERFACE + ".InvalidRequest", "Invalid attention request")
+            return
+        except Exception:
+            invocation.return_dbus_error(INTERFACE + ".Failed", "Attention request failed")
+            self.transport_error = "Attention policy update failed"
+            self._emit_view()
+            return
+        invocation.return_dbus_error(INTERFACE + ".UnknownMethod", "Unknown method")
+
+    def _leader_update(self, state, settings, sender=None):
+        if self.engine is None:
+            self.error("Attention backend unavailable")
+            return
+        sender = sender or self.connection.get_unique_name()
+        if sender not in self.publishers and len(self.publishers) >= 16:
+            self.error("Too many attention publishers")
+            return
+        self.publishers[sender] = (state, settings)
+        if self.publisher is None:
+            self.publisher = sender
+        if sender != self.publisher:
+            return
+        self.notification_style = _validated_notification_style(
+            settings.get("_notificationStyle")
+        )
+        if self.transport_error == "No active bar publisher":
+            self.transport_error = ""
+        try:
+            self.engine.update(state, settings)
+            self._run_engine_tick()
+            self._emit_view()
+        except Exception:
+            self.transport_error = "Attention policy update failed"
+            self.error(self.transport_error)
+            self._emit_view()
+
+    def _leader_command(self, action, target):
+        if self.engine is None:
+            self.error("Attention backend unavailable")
+            return None
+        try:
+            result = _validated_action(self.engine.command(action, target))
+            self._run_engine_tick()
+            self._emit_view()
+            return result
+        except Exception:
+            self.transport_error = "Attention command failed"
+            self.error(self.transport_error)
+            self._emit_view()
+            return None
+
+    def _view_object(self):
+        if self.engine is None:
+            return _fallback_view(self.transport_error or "Attention backend unavailable")
+        try:
+            view = self.engine.view()
+        except Exception:
+            return _fallback_view("Attention policy view unavailable")
+        if not isinstance(view, dict) or not _validate_tree(view):
+            return _fallback_view("Attention policy view invalid")
+        view = dict(view)
+        if self.transport_error:
+            current = _bounded_text(view.get("error", ""), 256) or ""
+            if self.transport_error not in current:
+                view["error"] = (current + ("; " if current else "") + self.transport_error)[:256]
+        return view
+
+    def _view_text(self):
+        try:
+            return _json_text(self._view_object())
+        except (TypeError, ValueError, UnicodeError):
+            return _json_text(_fallback_view("Attention view exceeded its safety limit"))
+
+    def _emit_view(self):
+        if not self.is_leader:
+            return
+        text = self._view_text()
+        self._deliver_view_text(text)
+        if self.connection is not None:
+            try:
+                self.connection.emit_signal(
+                    None,
+                    OBJECT_PATH,
+                    INTERFACE,
+                    "ViewChanged",
+                    GLib.Variant("(s)", (text,)),
+                )
+            except GLib.Error:
+                pass
+
+    def _deliver_view_object(self, view):
+        try:
+            text = _json_text(view)
+        except (TypeError, ValueError, UnicodeError):
+            text = _json_text(_fallback_view("Attention view exceeded its safety limit"))
+        self._deliver_view_text(text)
+
+    def _deliver_view_text(self, text):
+        if text == self.last_view_text:
+            return
+        try:
+            if len(text.encode("utf-8")) > MAX_DBUS_BYTES:
+                raise ValueError("oversized view")
+            view = json.loads(text)
+            if not isinstance(view, dict) or not _validate_tree(view):
+                raise ValueError("invalid view")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            self.error("Invalid attention view received")
+            return
+        self.last_view_text = text
+        self.output.write({"kind": "attention", "attention": view})
+
+    def _on_view_signal(
+        self, _connection, _sender, _path, _interface, _signal, parameters
+    ):
+        if self.shutting_down or self.is_leader:
+            return
+        try:
+            (text,) = parameters.unpack()
+        except (TypeError, ValueError):
+            return
+        self._deliver_view_text(text)
+
+    def _on_name_owner_changed(
+        self, _connection, _sender, _path, _interface, _signal, parameters
+    ):
+        try:
+            name, old_owner, new_owner = parameters.unpack()
+        except (TypeError, ValueError):
+            return
+        if name == NOTIFY_NAME and self.is_leader:
+            self._apply_notification_owner(new_owner, initial=not self.notification_owner_known)
+        elif name == BUS_NAME and not self.is_leader and new_owner:
+            self._request_view()
+            if self.last_local_state:
+                self.pending_state = self.last_local_state
+                self._dispatch_state()
+            self._dispatch_command()
+        elif self.is_leader and name in self.publishers and not new_owner:
+            self.publishers.pop(name, None)
+            if self.publisher == name:
+                self.publisher = next(iter(self.publishers), None)
+                if self.publisher is not None:
+                    state, settings = self.publishers[self.publisher]
+                    self._leader_update(state, settings, self.publisher)
+                elif self.engine is not None:
+                    self.notification_style = dict(DEFAULT_NOTIFICATION_STYLE)
+                    self.engine.update({"servers": []}, {"notifications": False})
+                    self.transport_error = "No active bar publisher"
+                    self._run_engine_tick()
+                    self._emit_view()
+
+    def _on_requested_action(self, _connection, _sender, _path, _interface, _signal, parameters):
+        if self.shutting_down:
+            return
+        try:
+            (text,) = parameters.unpack()
+            if len(text.encode("utf-8")) > 65536:
+                return
+            action = _validated_action(json.loads(text))
+        except (TypeError, ValueError, UnicodeError):
+            return
+        if action is not None:
+            self.output.write(action)
+
+    def _request_view(self):
+        if self.connection is None or self.is_leader or self.get_view_inflight or self.shutting_down:
+            return
+        self.get_view_inflight = True
+        generation = self.role_generation
+        self.connection.call(
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE,
+            "GetView",
+            None,
+            GLib.VariantType.new("(s)"),
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            None,
+            self._on_get_view,
+            generation,
+        )
+
+    def _on_get_view(self, connection, result, generation):
+        self.get_view_inflight = False
+        try:
+            (text,) = connection.call_finish(result).unpack()
+        except GLib.Error:
+            if not self.shutting_down and generation == self.role_generation and not self.is_leader:
+                self.error("Attention leader unavailable")
+            return
+        if self.shutting_down or generation != self.role_generation or self.is_leader:
+            return
+        self._deliver_view_text(text)
+
+    def _dispatch_state(self):
+        if (
+            self.connection is None
+            or self.is_leader
+            or self.state_call_inflight
+            or self.pending_state is None
+            or self.shutting_down
+        ):
+            return
+        state_text, settings_text = self.pending_state
+        self.pending_state = None
+        self.state_call_inflight = True
+        generation = self.role_generation
+        self.connection.call(
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE,
+            "PublishState",
+            GLib.Variant("(ss)", (state_text, settings_text)),
+            GLib.VariantType.new("(s)"),
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            None,
+            self._on_state_reply,
+            generation,
+        )
+
+    def _on_state_reply(self, connection, result, generation):
+        self.state_call_inflight = False
+        try:
+            (text,) = connection.call_finish(result).unpack()
+        except GLib.Error:
+            if not self.shutting_down and generation == self.role_generation and not self.is_leader:
+                self.error("Attention leader unavailable")
+        else:
+            if not self.shutting_down and generation == self.role_generation and not self.is_leader:
+                self._deliver_view_text(text)
+        self._dispatch_state()
+
+    def _dispatch_command(self):
+        if (
+            self.connection is None
+            or self.is_leader
+            or self.command_call_inflight
+            or not self.command_queue
+            or self.shutting_down
+        ):
+            return
+        action, target = self.command_queue.popleft()
+        self.command_call_inflight = True
+        generation = self.role_generation
+        self.connection.call(
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE,
+            "RunCommand",
+            GLib.Variant("(ss)", (action, target)),
+            GLib.VariantType.new("(ss)"),
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            None,
+            self._on_command_reply,
+            (generation, action, target),
+        )
+
+    def _on_command_reply(self, connection, result, context):
+        generation, requested_action, requested_target = context
+        self.command_call_inflight = False
+        try:
+            result_text, view_text = connection.call_finish(result).unpack()
+        except GLib.Error:
+            if not self.shutting_down and generation != self.role_generation and self.is_leader:
+                action = self._leader_command(requested_action, requested_target)
+                if action is not None:
+                    self.output.write(action)
+            elif not self.shutting_down and generation == self.role_generation and not self.is_leader:
+                self.error("Attention command could not reach the leader")
+        else:
+            if not self.shutting_down and result_text:
+                try:
+                    action = _validated_action(json.loads(result_text))
+                except (TypeError, ValueError, RecursionError):
+                    action = None
+                if action is not None:
+                    self.output.write(action)
+            if not self.shutting_down and generation == self.role_generation and not self.is_leader:
+                self._deliver_view_text(view_text)
+        self._dispatch_command()
+
+    def _load_transport_state(self):
+        self.stored_owner = ""
+        self.stored_slots = {}
+        try:
+            value = self.state_file.load({})
+        except Exception:
+            self.persistence_ok = False
+            self.transport_error = "Notification transport state unavailable"
+            return
+        if not isinstance(value, dict):
+            return
+        owner = value.get("server_owner")
+        records = value.get("slots")
+        if not isinstance(owner, str) or not isinstance(records, dict) or len(records) > MAX_SLOTS:
+            return
+        clean = {}
+        for key, record in records.items():
+            key = _opaque_id(key, 256)
+            if key is None or not isinstance(record, dict):
+                continue
+            notification_id = record.get("id")
+            actions = record.get("actions", [])
+            target = _opaque_id(record.get("target", ""), 96)
+            if (
+                isinstance(notification_id, bool)
+                or not isinstance(notification_id, int)
+                or not (0 < notification_id <= 0xFFFFFFFF)
+                or not isinstance(actions, list)
+                or len(actions) > 8
+                or target is None
+            ):
+                continue
+            allowed = []
+            for action in actions:
+                if isinstance(action, str) and action in NOTIFICATION_ACTIONS and action not in allowed:
+                    allowed.append(action)
+            clean[key] = {
+                "id": notification_id,
+                "actions": frozenset(allowed),
+                "target": target,
+                "generation": 0,
+                # Policy action tokens belong to the previous helper process.
+                # Retire its popups; the durable attention queue is restored separately.
+                "closing": True,
+            }
+        self.stored_owner = owner
+        self.stored_slots = clean
+
+    def _save_transport_state(self):
+        if self.transport_save_deferred:
+            self.transport_save_pending = True
+            return
+        if not self.is_leader or self.state_file is None or not self.persistence_ok:
+            return
+        records = {}
+        for key, slot in list(self.slots.items())[:MAX_SLOTS]:
+            records[key] = {
+                "id": slot["id"],
+                "actions": sorted(slot["actions"]),
+                "target": slot.get("target", ""),
+                "closing": bool(slot.get("closing")),
+            }
+        try:
+            self.state_file.save(
+                {"server_owner": self.notification_owner, "slots": records}
+            )
+        except Exception:
+            self.persistence_ok = False
+            self.transport_error = "Notification transport state unavailable"
+            self._emit_view()
+
+    def _begin_transport_batch(self):
+        self.transport_save_deferred += 1
+
+    def _end_transport_batch(self):
+        self.transport_save_deferred = max(0, self.transport_save_deferred - 1)
+        if not self.transport_save_deferred and self.transport_save_pending:
+            self.transport_save_pending = False
+            self._save_transport_state()
+
+    def _query_notification_owner(self):
+        if self.connection is None:
+            self._apply_notification_owner("", initial=True)
+            return
+        generation = self.role_generation
+        self.connection.call(
+            DBUS_NAME,
+            DBUS_PATH,
+            DBUS_INTERFACE,
+            "GetNameOwner",
+            GLib.Variant("(s)", (NOTIFY_NAME,)),
+            GLib.VariantType.new("(s)"),
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            None,
+            self._on_notification_owner_reply,
+            generation,
+        )
+
+    def _on_notification_owner_reply(self, connection, result, generation):
+        try:
+            (owner,) = connection.call_finish(result).unpack()
+        except GLib.Error:
+            owner = ""
+        if (
+            self.shutting_down
+            or not self.is_leader
+            or generation != self.role_generation
+            or self.notification_owner_known
+        ):
+            return
+        self._apply_notification_owner(owner, initial=True)
+
+    def _apply_notification_owner(self, owner, initial=False):
+        owner = owner if isinstance(owner, str) and owner.startswith(":") else ""
+        if self.notification_owner_known and owner == self.notification_owner:
+            return
+        old_owner = self.notification_owner
+        self.notification_owner_known = True
+        self.notification_owner = owner
+        self.notification_generation += 1
+
+        for _sequence, pending in list(self.notify_inflight.items()):
+            if self.engine is not None:
+                try:
+                    self.engine.notification_result(pending["key"], pending["token"], False)
+                except Exception:
+                    pass
+        self.notify_inflight.clear()
+        self.notify_keys_inflight.clear()
+        self.pending_close_keys.clear()
+        self.close_inflight.clear()
+        self.pending_close_requests.clear()
+
+        if initial and owner and self.stored_owner == owner:
+            self.slots = self.stored_slots
+            self.notification_ids = {
+                slot["id"]: key
+                for key, slot in self.slots.items()
+                if not slot.get("closing")
+            }
+            for slot in self.slots.values():
+                self.slot_generation += 1
+                slot["generation"] = self.slot_generation
+            for key, slot in list(self.slots.items()):
+                if slot.get("closing"):
+                    if len(self.close_inflight) >= MAX_CLOSE_INFLIGHT:
+                        self.pending_close_requests[key] = None
+                    else:
+                        self._send_close(key)
+        else:
+            self.slots.clear()
+            self.notification_ids.clear()
+
+        self.stored_owner = ""
+        self.stored_slots = {}
+        if owner:
+            if self.transport_error in (
+                "Desktop notification service unavailable",
+                "Desktop notification delivery failed",
+                "Desktop notification closure failed",
+            ):
+                self.transport_error = ""
+        else:
+            self.transport_error = "Desktop notification service unavailable"
+        self._save_transport_state()
+
+        if not owner:
+            for key, effect in list(self.pending_notifies.items()):
+                self._notification_failed(key, effect["token"])
+            self.pending_notifies.clear()
+        else:
+            self._drain_pending_notifies()
+        if old_owner != owner:
+            self._emit_view()
+
+    def _run_engine_tick(self):
+        if self.shutting_down or self.engine is None or not self.is_leader:
+            return
+        try:
+            effects = self.engine.tick()
+        except Exception:
+            self.transport_error = "Attention policy tick failed"
+            return
+        if not isinstance(effects, list):
+            self.transport_error = "Attention policy returned invalid effects"
+            return
+        if len(effects) > MAX_EFFECTS:
+            effects = effects[:MAX_EFFECTS]
+            self.transport_error = "Attention policy returned too many effects"
+        self._begin_transport_batch()
+        try:
+            for effect in effects:
+                self._handle_effect(effect)
+        finally:
+            self._end_transport_batch()
+
+    def _handle_effect(self, effect):
+        if not isinstance(effect, dict):
+            self.transport_error = "Attention policy returned an invalid effect"
+            return
+        op = effect.get("op")
+        key = _opaque_id(effect.get("key"), 256)
+        if key is None:
+            self.transport_error = "Attention policy returned an invalid effect"
+            return
+        if op == "close":
+            pending = self.pending_notifies.pop(key, None)
+            if pending is not None:
+                self._notification_failed(key, pending["token"])
+            inflight = False
+            for call in self.notify_inflight.values():
+                if call["key"] == key:
+                    call["cancelled"] = True
+                    inflight = True
+            if inflight:
+                self.pending_close_keys.add(key)
+            else:
+                self._close_slot(key)
+            return
+        if op != "notify":
+            self.transport_error = "Attention policy returned an invalid effect"
+            return
+        token = effect.get("token")
+        if isinstance(token, bool) or not isinstance(token, int) or not (0 <= token <= 0x7FFFFFFFFFFFFFFF):
+            self.transport_error = "Attention policy returned an invalid effect"
+            return
+        summary = _bounded_text(effect.get("summary"), 160)
+        body = _bounded_text(effect.get("body"), 2048, multiline=True)
+        actions = effect.get("actions")
+        status = _bounded_text(effect.get("status"), 16)
+        entry_ids = effect.get("entry_ids")
+        target = _opaque_id(entry_ids[0], 96) if isinstance(entry_ids, list) and entry_ids else None
+        timeout_ms = effect.get("timeout_ms", 8000)
+        if (
+            summary is None
+            or body is None
+            or target is None
+            or status not in NOTIFICATION_STATUSES
+            or not isinstance(actions, list)
+            or len(actions) != 1
+            or isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or not (1000 <= timeout_ms <= 30000)
+        ):
+            self._notification_failed(key, token)
+            return
+        action = actions[0]
+        if not isinstance(action, dict):
+            self._notification_failed(key, token)
+            return
+        action_id = action.get("id")
+        label = _bounded_text(action.get("label"), 80)
+        if not isinstance(action_id, str) or action_id not in NOTIFICATION_ACTIONS or not label:
+            self._notification_failed(key, token)
+            return
+        clean = {
+            "key": key,
+            "token": token,
+            "target": target,
+            "status": status,
+            "summary": summary,
+            "body": body,
+            "action": (action_id, label),
+            "timeout_ms": timeout_ms,
+        }
+        previous = self.pending_notifies.pop(key, None)
+        if previous is not None:
+            self._notification_failed(key, previous["token"])
+        if (
+            len(self.notify_inflight) >= MAX_NOTIFY_INFLIGHT
+            or key in self.notify_keys_inflight
+            or not self.notification_owner_known
+        ):
+            if len(self.pending_notifies) >= MAX_SLOTS:
+                _old_key, old = self.pending_notifies.popitem(last=False)
+                self._notification_failed(old["key"], old["token"])
+            self.pending_notifies[key] = clean
+            return
+        self._send_notification(clean)
+
+    def _drain_pending_notifies(self):
+        while (
+            not self.shutting_down
+            and self.pending_notifies
+            and len(self.notify_inflight) < MAX_NOTIFY_INFLIGHT
+            and self.notification_owner_known
+        ):
+            key = next(
+                (
+                    candidate
+                    for candidate in self.pending_notifies
+                    if candidate not in self.notify_keys_inflight
+                ),
+                None,
+            )
+            if key is None:
+                return
+            effect = self.pending_notifies.pop(key)
+            self._send_notification(effect)
+
+    def _notification_image(self, status):
+        style = self.notification_style
+        cache_key = (
+            status,
+            style["glyph"],
+            style["fontFamily"],
+            style["background"],
+            style["blocked"],
+            style["done"],
+            style["working"],
+            style["offline"],
+        )
+        image = self.notification_icon_cache.get(cache_key)
+        if image is not None:
+            self.notification_icon_cache.move_to_end(cache_key)
+            return image
+        try:
+            image = _rasterize_notification_icon(style, status)
+        except Exception:
+            return None
+        self.notification_icon_cache[cache_key] = image
+        if len(self.notification_icon_cache) > MAX_ICON_CACHE:
+            self.notification_icon_cache.popitem(last=False)
+        return image
+
+    def _send_notification(self, effect):
+        key = effect["key"]
+        token = effect["token"]
+        if not self.notification_owner:
+            self._notification_failed(key, token)
+            return
+        slot = self.slots.get(key)
+        replaces_id = slot["id"] if slot is not None and not slot.get("closing") else 0
+        action_id, label = effect["action"]
+        image = self._notification_image(effect["status"])
+        if image is None:
+            self._notification_failed(key, token)
+            self.transport_error = "Desktop notification icon rendering failed"
+            return
+        action_words = ["default", html.escape(label, quote=False)]
+        hints = {
+            "urgency": GLib.Variant("y", 1),
+            "suppress-sound": GLib.Variant("b", True),
+            "image-data": image,
+            # Omarchy persists this argv when the original D-Bus sender exits.
+            # Use the same durable entry ID as the native default action.
+            "omarchy-exec-argv": GLib.Variant("s", json.dumps([
+                "omarchy-shell", "njpatel.omaherdr", "notice", action_id, effect["target"],
+            ], separators=(",", ":"))),
+        }
+        parameters = GLib.Variant(
+            "(susssasa{sv}i)",
+            (
+                "Omaherdr",
+                replaces_id,
+                "",
+                html.escape(effect["summary"], quote=False),
+                html.escape(effect["body"], quote=False),
+                action_words,
+                hints,
+                effect["timeout_ms"],
+            ),
+        )
+        self.notify_sequence += 1
+        sequence = self.notify_sequence
+        pending = {
+            "key": key,
+            "token": token,
+            "actions": frozenset((action_id,)),
+            "target": effect["target"],
+            "owner": self.notification_owner,
+            "notification_generation": self.notification_generation,
+            "role_generation": self.role_generation,
+            "sequence": sequence,
+            "cancelled": False,
+        }
+        self.notify_inflight[sequence] = pending
+        self.notify_keys_inflight.add(key)
+        self.connection.call(
+            self.notification_owner,
+            NOTIFY_PATH,
+            NOTIFY_INTERFACE,
+            "Notify",
+            parameters,
+            GLib.VariantType.new("(u)"),
+            Gio.DBusCallFlags.NONE,
+            NOTIFY_TIMEOUT_MS,
+            None,
+            self._on_notify_reply,
+            sequence,
+        )
+
+    def _on_notify_reply(self, connection, result, sequence):
+        pending = self.notify_inflight.pop(sequence, None)
+        if pending is not None:
+            self.notify_keys_inflight.discard(pending["key"])
+        if pending is None:
+            try:
+                connection.call_finish(result)
+            except GLib.Error:
+                pass
+            return
+        valid_context = (
+            self.is_leader
+            and pending["role_generation"] == self.role_generation
+            and pending["notification_generation"] == self.notification_generation
+            and pending["owner"] == self.notification_owner
+        )
+        try:
+            (notification_id,) = connection.call_finish(result).unpack()
+            transport_success = (
+                valid_context
+                and isinstance(notification_id, int)
+                and not isinstance(notification_id, bool)
+                and 0 < notification_id <= 0xFFFFFFFF
+            )
+        except GLib.Error:
+            notification_id = 0
+            transport_success = False
+        cancelled = bool(pending.get("cancelled"))
+        delivery_success = transport_success and not cancelled
+        if transport_success:
+            key = pending["key"]
+            old = self.slots.get(key)
+            if old is not None:
+                self.notification_ids.pop(old["id"], None)
+            self.slot_generation += 1
+            self.slots[key] = {
+                "id": notification_id,
+                "actions": pending["actions"],
+                "target": pending["target"],
+                "generation": self.slot_generation,
+                "closing": False,
+            }
+            self.notification_ids[notification_id] = key
+            self._save_transport_state()
+            if self.persistence_ok and self.transport_error in (
+                "Desktop notification service unavailable",
+                "Desktop notification delivery failed",
+                "Desktop notification closure failed",
+                "Desktop notification icon rendering failed",
+            ):
+                self.transport_error = ""
+        elif not cancelled:
+            self.transport_error = (
+                "Desktop notification service unavailable"
+                if not self.notification_owner
+                else "Desktop notification delivery failed"
+            )
+        if self.engine is not None and valid_context:
+            try:
+                self.engine.notification_result(
+                    pending["key"], pending["token"], delivery_success
+                )
+            except Exception:
+                self.transport_error = "Attention policy notification update failed"
+        if cancelled:
+            self.pending_close_keys.discard(pending["key"])
+            self._close_slot(pending["key"])
+        self._run_engine_tick()
+        self._emit_view()
+        self._drain_pending_notifies()
+        if self.shutting_down:
+            self._check_shutdown_complete()
+
+    def _notification_failed(self, key, token):
+        if self.engine is not None:
+            try:
+                self.engine.notification_result(key, token, False)
+            except Exception:
+                self.transport_error = "Attention policy notification update failed"
+        if not self.notification_owner:
+            self.transport_error = "Desktop notification service unavailable"
+        else:
+            self.transport_error = "Desktop notification delivery failed"
+
+    def _close_slot(self, key):
+        slot = self.slots.get(key)
+        if slot is None:
+            return
+        if not self.notification_owner or self.connection is None:
+            return
+        if not slot.get("closing"):
+            self.slot_generation += 1
+            slot["generation"] = self.slot_generation
+            slot["closing"] = True
+            self.notification_ids.pop(slot["id"], None)
+            self._save_transport_state()
+        if key in self.pending_close_requests or any(
+            context["key"] == key for context in self.close_inflight.values()
+        ):
+            return
+        if len(self.close_inflight) >= MAX_CLOSE_INFLIGHT:
+            self.pending_close_requests[key] = None
+            return
+        self._send_close(key)
+
+    def _send_close(self, key):
+        slot = self.slots.get(key)
+        if slot is None or not slot.get("closing") or not self.notification_owner:
+            return
+        self.close_sequence += 1
+        sequence = self.close_sequence
+        context = {
+            "key": key,
+            "id": slot["id"],
+            "generation": slot["generation"],
+            "owner": self.notification_owner,
+            "notification_generation": self.notification_generation,
+            "role_generation": self.role_generation,
+        }
+        self.close_inflight[sequence] = context
+        self.connection.call(
+            self.notification_owner,
+            NOTIFY_PATH,
+            NOTIFY_INTERFACE,
+            "CloseNotification",
+            GLib.Variant("(u)", (slot["id"],)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            None,
+            self._on_close_reply,
+            sequence,
+        )
+
+    def _drain_close_requests(self):
+        while self.pending_close_requests and len(self.close_inflight) < MAX_CLOSE_INFLIGHT:
+            key, _unused = self.pending_close_requests.popitem(last=False)
+            self._send_close(key)
+
+    def _on_close_reply(self, connection, result, sequence):
+        context = self.close_inflight.pop(sequence, None)
+        try:
+            connection.call_finish(result)
+            success = True
+        except GLib.Error:
+            success = False
+        if context is None:
+            return
+        key = context["key"]
+        notification_id = context["id"]
+        slot = self.slots.get(key)
+        valid = (
+            self.is_leader
+            and context["role_generation"] == self.role_generation
+            and context["notification_generation"] == self.notification_generation
+            and context["owner"] == self.notification_owner
+            and slot is not None
+            and slot["id"] == notification_id
+            and slot["generation"] == context["generation"]
+            and slot.get("closing")
+        )
+        if valid and success:
+            self.slots.pop(key, None)
+            self._save_transport_state()
+        elif valid and not success:
+            self.transport_error = "Desktop notification closure failed"
+            self._emit_view()
+        self._drain_close_requests()
+        if self.shutting_down:
+            self._check_shutdown_complete()
+
+    def _on_notification_action(
+        self, _connection, sender, _path, _interface, _signal, parameters
+    ):
+        if not self.is_leader or sender != self.notification_owner or self.engine is None:
+            return
+        try:
+            notification_id, action_id = parameters.unpack()
+        except (TypeError, ValueError):
+            return
+        if isinstance(notification_id, bool) or not isinstance(notification_id, int):
+            return
+        key = self.notification_ids.get(notification_id)
+        slot = self.slots.get(key) if key is not None else None
+        if slot is None or slot.get("closing"):
+            return
+        if action_id != "default" or len(slot["actions"]) != 1:
+            return
+        logical_action = next(iter(slot["actions"]))
+        target = _opaque_id(slot.get("target"), 96)
+        if logical_action not in NOTIFICATION_ACTIONS or target is None:
+            return
+        try:
+            result = _validated_action(self.engine.command(logical_action, target))
+        except Exception:
+            self.transport_error = "Attention notification action failed"
+            self._emit_view()
+            return
+        if result is not None and self.publisher is not None:
+            if self.publisher == self.connection.get_unique_name():
+                self.output.write(result)
+            else:
+                try:
+                    self.connection.emit_signal(
+                        self.publisher, OBJECT_PATH, INTERFACE, "ActionRequested",
+                        GLib.Variant("(s)", (_json_text(result, 65536),)),
+                    )
+                except GLib.Error:
+                    self.error("Attention action could not reach its bar")
+        self._run_engine_tick()
+        self._emit_view()
+
+    def _on_notification_closed(
+        self, _connection, sender, _path, _interface, _signal, parameters
+    ):
+        if not self.is_leader or sender != self.notification_owner or self.engine is None:
+            return
+        try:
+            notification_id, reason = parameters.unpack()
+        except (TypeError, ValueError):
+            return
+        if (
+            isinstance(notification_id, bool)
+            or not isinstance(notification_id, int)
+            or isinstance(reason, bool)
+            or not isinstance(reason, int)
+        ):
+            return
+        key = self.notification_ids.pop(notification_id, None)
+        if key is None:
+            for candidate, slot in self.slots.items():
+                if slot["id"] == notification_id and slot.get("closing"):
+                    key = candidate
+                    break
+        if key is None:
+            return
+        slot = self.slots.get(key)
+        if slot is None or slot["id"] != notification_id:
+            return
+        self.slots.pop(key, None)
+        self._save_transport_state()
+        try:
+            self.engine.notification_closed(key, reason)
+        except Exception:
+            self.transport_error = "Attention policy notification update failed"
+        self._run_engine_tick()
+        self._emit_view()
+        if self.shutting_down:
+            self._check_shutdown_complete()
+
+    def _on_tick(self):
+        if self.shutting_down:
+            return False
+        if self.is_leader:
+            self._run_engine_tick()
+            self._emit_view()
+        return True
+
+    def begin_shutdown(self):
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        if self.stdin_watch_id:
+            try:
+                GLib.source_remove(self.stdin_watch_id)
+            except GLib.Error:
+                pass
+            self.stdin_watch_id = 0
+        self.pending_state = None
+        self.command_queue.clear()
+        self.pending_notifies.clear()
+        if self.is_leader and self.engine is not None:
+            self._begin_transport_batch()
+            try:
+                try:
+                    effects = self.engine.close_all()
+                except Exception:
+                    effects = []
+                if isinstance(effects, list):
+                    for effect in effects[:MAX_EFFECTS]:
+                        if isinstance(effect, dict) and effect.get("op") == "close":
+                            key = _opaque_id(effect.get("key"), 256)
+                            if key is not None:
+                                self._handle_effect(effect)
+                for call in self.notify_inflight.values():
+                    call["cancelled"] = True
+                    self.pending_close_keys.add(call["key"])
+                for key in list(self.slots):
+                    if key not in self.notify_keys_inflight:
+                        self._close_slot(key)
+            finally:
+                self._end_transport_batch()
+            self.shutdown_deadline_id = GLib.timeout_add(7000, self._finish_shutdown)
+            self._check_shutdown_complete()
+        else:
+            self._finish_shutdown()
+
+    def _check_shutdown_complete(self):
+        if not self.shutting_down:
+            return
+        if (
+            not any(slot.get("closing") for slot in self.slots.values())
+            and not self.notify_inflight
+        ):
+            self._finish_shutdown()
+
+    def _finish_shutdown(self):
+        if self.shutdown_deadline_id:
+            try:
+                GLib.source_remove(self.shutdown_deadline_id)
+            except GLib.Error:
+                pass
+            self.shutdown_deadline_id = 0
+        if self.connection is not None:
+            if self.registration_id:
+                try:
+                    self.connection.unregister_object(self.registration_id)
+                except GLib.Error:
+                    pass
+                self.registration_id = 0
+            for subscription_id in self.subscription_ids:
+                try:
+                    self.connection.signal_unsubscribe(subscription_id)
+                except GLib.Error:
+                    pass
+            self.subscription_ids.clear()
+        if self.owner_id:
+            Gio.bus_unown_name(self.owner_id)
+            self.owner_id = 0
+        self.is_leader = False
+        self.loop.quit()
+        return False
+
+
+def main():
+    bridge = Bridge()
+    try:
+        bridge.start()
+    except KeyboardInterrupt:
+        bridge.begin_shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        _startup_error("Attention backend stopped unexpectedly")
+        raise SystemExit(1)
