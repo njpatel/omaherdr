@@ -55,28 +55,34 @@ Status is live: the daemon subscribes to herdr's events, so the bar flips the mo
 
 ## Attention and notifications
 
-Open the attention list with `v` or `omarchy-shell njpatel.omaherdr attention`. It retains agents needing input or marked done, including snoozed and muted entries. Muted workspaces remain selectable after their agents finish, so `m` can unmute them. Offline entries show the last known state, not a live agent; ages mean when Omaherdr noticed a state, not when a particular question was asked.
+`v` cycles agents, spaces and attention. Attention lists agents waiting for input or done, including snoozed, muted and last-known offline entries. `s` snoozes the selected item, `S` restores it, and `m` mutes or unmutes its workspace. Muted workspaces stay in the list so you can unmute them later. Ages mean when Omaherdr noticed a state, not when an agent asked a question.
 
-Desktop notifications are off by default. Enable them with `n` or:
+Desktop notifications are **off by default**. Press `n` in the panel to switch them on or off, use **Desktop alerts** in the widget settings, or set them directly:
 
 ```sh
 omarchy bar set njpatel.omaherdr notifications true
-omarchy bar set njpatel.omaherdr watchSavedMachines true
+omarchy bar set njpatel.omaherdr notifications false
 ```
 
-The second setting is optional and permits background SSH monitoring of enabled saved profiles, even without an attached terminal. Existing SSH trust and authentication must already work non-interactively. Omaherdr does not change herdr configuration or start replacement servers.
+Switching them off stops new alerts without hiding the bar lights or clearing attention. Cards already kept by Omapager, and notification history, belong to the notification service; dismiss them there. Omaherdr does not change herdr's own toast setting. Turn those off in herdr if you want only Omaherdr's notifications.
 
-New needs-input episodes produce one alert; completions are grouped by server and workspace. Each toast provides only a default action: try opening the current agent (the first listed agent for a group), or show the attention list if a safe jump is unavailable. Connection alerts open the attention list. Dismissing a popup never answers or acknowledges a request. No separate snooze or mute actions are sent to the notification renderer; its own controls remain its responsibility. Existing attention-panel snooze and mute controls remain available.
+An agent needing input gets one alert; agents finishing together are grouped by server and workspace. The icon is your chosen bar icon, centred in a box tinted red for input, green for done or grey for connection loss. The text names the workspace, agent and any meaningful tab name, rather than a bare tab number. Herdr 0.9 has no structured last-message field, so Omaherdr shows state and location instead of scraping terminal text or reading session files.
 
-The notification icon uses your selected `barIcon` and font inside a state-tinted box: theme red for needs-input, green for done and muted colour for connection loss. Icons are rendered locally in memory and sent as standard raw image data, not fetched from a website or written to icon files. The title names the state and workspace; the body keeps meaningful agent/tab names and remote/session context, omitting numeric tabs and duplicate labels.
+Click to return to the agent's pane (the first listed agent for a group). If there is no known dedicated terminal window, or the target has gone away, the attention list opens instead. Connection alerts open that list too. Focusing a done agent can acknowledge it through herdr; dismissing a notification cannot. Nothing here answers or approves an agent's request.
 
-Omapager may display the default action as its own **Open in app** button. Card-body clicks invoke it only when Omapager's `allowDefaultActionOnCardClick` setting is enabled; Omaherdr never changes that setting. The explicit button remains usable with it disabled. Enabling it applies to all notification senders, not just Omaherdr:
+Omapager offers **Open in app** for that action. To make clicking anywhere on its card do the same, enable the setting below. It applies to **all senders**, not just Omaherdr; Omaherdr does not switch it on for you. Omapager owns its notification snooze, mute and history controls.
 
 ```sh
 omarchy bar set njpatel.omapager allowDefaultActionOnCardClick true --json
 ```
 
-The stock Omarchy renderer also receives a persisted click action using the same opaque attention identity, so its retained toast can still navigate after the original sender exits. Omapager uses live native actions instead; restoration and history behaviour belong to the renderer.
+To also watch enabled herdr 0.9 saved machines without an attached terminal:
+
+```sh
+omarchy bar set njpatel.omaherdr watchSavedMachines true
+```
+
+That uses the saved SSH profiles, which must already work non-interactively. It neither starts servers nor switches machines inside a combined herdr client.
 
 | setting | default | behaviour |
 |---|---|---|
@@ -87,9 +93,7 @@ The stock Omarchy renderer also receives a persisted click action using the same
 | `quietStart`, `quietEnd` | empty | local `HH:MM`; supports overnight ranges; equal or unset values disable quiet hours |
 | `watchSavedMachines` | `false` | monitor enabled herdr 0.9 saved profiles |
 
-Set each with `omarchy bar set njpatel.omaherdr SETTING VALUE`. Quiet hours suppress popups, not the queue. Startup, reconnect and enabling notifications establish a baseline rather than replaying every pending item. A sustained connection failure produces one endpoint alert, not one per agent. Multiple widget copies share one notification publisher, preventing duplicate alerts.
-
-Herdr 0.9 exposes terminal snapshots, but no structured last-assistant-message field. Omaherdr therefore uses the state and location context above; it does not scrape terminal UI text or read agent session files to invent a reply preview. Notifications contain no terminal transcripts, command previews, question text or inline replies/approvals. The desktop notification service's own history and do-not-disturb policy still apply. Missing attention or notification services are reported in the panel; ordinary discovery remains available.
+Set each with `omarchy bar set njpatel.omaherdr SETTING VALUE`. Quiet hours hold back popups, not attention. Startup, reconnect and switching alerts on do not replay everything already pending. A sustained connection failure produces one alert for the session, not one per agent. Missing notification services are shown in the panel; ordinary discovery still works.
 
 ## Removing
 
@@ -114,6 +118,8 @@ Anything else gets the window. Windows are matched from the client's process tre
 ## How it works
 
 `bin/omaherdr-daemon` scans processes every 10 s, maps each herdr client to its Hyprland window, and runs one `bin/omaherdr-helper` per server (shipped inline over ssh for remote hosts). The helper subscribes to workspace, tab and pane events, waits for acknowledgement, then takes a `session.snapshot`. It adds per-pane agent-status subscriptions and takes another snapshot after each subscription change, covering changes while a stream is replaced. The daemon folds the snapshots and live events into one JSON state per change, which `Widget.qml` renders. Jumps go the other way: `focuswindow` in Hyprland, then the terminal tab that hosts the client (kitty via its remote control, WezTerm via `wezterm cli`; foot and Alacritty have no tabs, so the window is enough; Ghostty and `foot --server` run every window from one process, so the window is picked by its herdr title), then `workspace.focus` / `tab.focus` / `pane.focus` on the right server.
+
+The local `bin/omaherdr-notify` helper tracks attention and sends desktop notifications over D-Bus. Widget copies share one publisher, so multiple bars do not produce duplicate alerts. It saves snoozes, workspace mutes and delivery history locally, and renders the selected icon in memory using the current theme. Native notification clicks are tied to current agent identities. The stock Omarchy renderer also keeps a click command across helper restarts; Omapager's native actions depend on a live sender. Neither helper reads agent transcripts or sends answers.
 
 ## Development
 
